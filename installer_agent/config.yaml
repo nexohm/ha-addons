@@ -10,7 +10,7 @@ arch:
 # Immagini precompilate (pubblicate dal workflow .github/workflows/addon-image.yml).
 # Togli il "#" dopo la prima pubblicazione e dopo aver reso pubblici i pacchetti su GitHub:
 # da quel momento HA scarica l'add-on già pronto invece di compilarlo sul dispositivo.
-# image: "ghcr.io/nexohm/{arch}-addon-installer_agent"
+image: "ghcr.io/nexohm/{arch}-addon-installer_agent"
 init: false
 startup: application
 boot: auto
