@@ -1,0 +1,36 @@
+name: Agente Assistenza
+version: "0.1.0"
+slug: installer_agent
+description: Collega questo Home Assistant al servizio di assistenza del tuo installatore
+url: https://github.com/nexohm/ha-addons
+arch:
+  - aarch64
+  - amd64
+  - armv7
+# Immagini precompilate (pubblicate dal workflow .github/workflows/addon-image.yml).
+# Togli il "#" dopo la prima pubblicazione e dopo aver reso pubblici i pacchetti su GitHub:
+# da quel momento HA scarica l'add-on già pronto invece di compilarlo sul dispositivo.
+# image: "ghcr.io/nexohm/{arch}-addon-installer_agent"
+init: false
+startup: application
+boot: auto
+# Pannello "Assistenza" nella barra laterale, servito tramite ingress (nessuna porta esposta)
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:face-agent
+panel_title: Assistenza
+# Lettura di stati e configurazione di Home Assistant
+homeassistant_api: true
+# Lettura di info sistema, disco e backup dal Supervisor
+hassio_api: true
+hassio_role: backup
+options:
+  server_url: ""
+  pair_code: ""
+  heartbeat_seconds: 60
+  diagnostics_minutes: 15
+schema:
+  server_url: url?
+  pair_code: "match(^$|^[A-Za-z0-9]{4}-?[A-Za-z0-9]{4}$)?"
+  heartbeat_seconds: int(15,3600)
+  diagnostics_minutes: int(1,1440)

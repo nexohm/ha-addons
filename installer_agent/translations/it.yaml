@@ -1,0 +1,13 @@
+configuration:
+  server_url:
+    name: Indirizzo del server di assistenza
+    description: Te lo fornisce il tuo installatore (es. https://assistenza.rossiimpianti.it)
+  pair_code:
+    name: Codice di abbinamento
+    description: Codice di 8 caratteri generato dall'installatore, valido 24 ore
+  heartbeat_seconds:
+    name: Intervallo di collegamento (secondi)
+    description: Ogni quanto l'agente comunica al server che l'impianto è acceso
+  diagnostics_minutes:
+    name: Intervallo di controllo (minuti)
+    description: Ogni quanto viene eseguito il controllo automatico dell'impianto
