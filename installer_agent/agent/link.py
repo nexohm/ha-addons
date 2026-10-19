@@ -6,7 +6,7 @@ import threading
 import urllib.error
 import urllib.request
 
-AGENT_VERSION = "0.1.0"
+AGENT_VERSION = "0.1.1"
 PROTOCOL = 1
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
@@ -50,9 +50,12 @@ class State:
 
 
 class ServerError(Exception):
-    def __init__(self, status, message):
+    def __init__(self, status, message, from_server=True):
         super().__init__(message)
         self.status = status
+        # False quando la risposta non arriva dal server Nexohm ma da qualcosa in mezzo
+        # (Cloudflare, un proxy, un firewall): in quel caso un 401 non vuol dire "revocato".
+        self.from_server = from_server
 
 
 class Link:
@@ -61,7 +64,9 @@ class Link:
 
     def _request(self, method, path, body=None, timeout=30, auth=True, base=None):
         base = (base or self.state.get("server_url") or "").rstrip("/")
-        headers = {"Content-Type": "application/json", "X-Agent-Protocol": str(PROTOCOL),
+        # Un'identità propria: filtri anti-bot (es. Cloudflare) bloccano spesso "Python-urllib".
+        headers = {"User-Agent": f"NexohmAgent/{AGENT_VERSION} (Home Assistant add-on)",
+                   "Content-Type": "application/json", "X-Agent-Protocol": str(PROTOCOL),
                    "X-Agent-Version": AGENT_VERSION, "Accept": "application/json"}
         if auth:
             headers["Authorization"] = f"Bearer {self.state.get('token')}"
@@ -71,11 +76,18 @@ class Link:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read().decode() or "{}")
         except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
             try:
-                message = json.loads(e.read().decode()).get("error", e.reason)
-            except ValueError:
-                message = str(e.reason)
-            raise ServerError(e.code, message) from e
+                message = json.loads(body).get("error") or str(e.reason)
+                from_server = True
+            except (ValueError, AttributeError):
+                from_server = False
+                if e.code == 403 or "cloudflare" in body.lower():
+                    message = (f"bloccato prima di raggiungere il server ({e.code} {e.reason}): "
+                               "controlla le regole di sicurezza di Cloudflare o del proxy")
+                else:
+                    message = f"risposta inattesa dal proxy davanti al server ({e.code} {e.reason})"
+            raise ServerError(e.code, message, from_server) from e
         except (urllib.error.URLError, OSError, ValueError) as e:
             raise ServerError(0, f"server non raggiungibile: {getattr(e, 'reason', e)}") from e
 

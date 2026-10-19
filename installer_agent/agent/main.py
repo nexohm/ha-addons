@@ -71,7 +71,9 @@ class Agent:
         return bool(self.state.get("token")) and self.state.get("connection") not in ("revocato", "aggiornare")
 
     def _handle_server_error(self, e: ServerError):
-        if e.status == 401:
+        if not e.from_server:
+            self.state.update(connection="errore", last_error=str(e))
+        elif e.status == 401:
             log.error("Il server ha rifiutato il token: abbinamento revocato.")
             self.state.update(connection="revocato", token=None,
                               last_error="L'installatore ha revocato il collegamento. Serve un nuovo codice di abbinamento.")
