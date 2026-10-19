@@ -1,4 +1,5 @@
 """Collegamento con il server dell'installatore e stato persistente dell'agente."""
+import ipaddress
 import json
 import logging
 import os
@@ -6,14 +7,51 @@ import threading
 import time
 from datetime import datetime, timezone
 import urllib.error
+import urllib.parse
 import urllib.request
 
-AGENT_VERSION = "0.1.3"
+AGENT_VERSION = "0.1.4"
 PROTOCOL = 1
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 
 log = logging.getLogger("agent")
+
+MAX_RESPONSE = 2 * 1024 * 1024  # nessuna risposta legittima del server si avvicina a 2 MB
+LOCAL_SUFFIXES = (".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain")
+
+
+def insecure_reason(url):
+    """Motivo per cui l'indirizzo del server non è accettabile, oppure None se va bene.
+
+    Il token dell'impianto e la diagnostica viaggiano a ogni richiesta: su internet devono
+    essere cifrati (https). L'http resta ammesso solo per server nella rete di casa."""
+    parts = urllib.parse.urlsplit(url or "")
+    host = (parts.hostname or "").lower()
+    if parts.scheme not in ("http", "https") or not host:
+        return "indirizzo del server non valido (es. https://assistenza.tuaditta.it)"
+    if parts.scheme == "https":
+        return None
+    if host == "localhost" or "." not in host or host.endswith(LOCAL_SUFFIXES):
+        return None
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return None
+    except ValueError:
+        pass
+    return "per sicurezza l'indirizzo del server deve iniziare con https:// (http è ammesso solo in rete locale)"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Niente reindirizzamenti: urllib li seguirebbe portandosi dietro il token, anche verso
+    un altro sito. Se il server risponde con un redirect lo segnaliamo come errore."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, f"reindirizzamento verso {newurl}", headers, fp)
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
 
 
 class State:
@@ -81,6 +119,9 @@ class Link:
 
     def _request(self, method, path, body=None, timeout=30, auth=True, base=None):
         base = (base or self.state.get("server_url") or "").rstrip("/")
+        reason = insecure_reason(base)
+        if reason:
+            raise ServerError(0, reason, from_server=False)
         # Un'identità propria: filtri anti-bot (es. Cloudflare) bloccano spesso "Python-urllib".
         headers = {"User-Agent": f"NexohmAgent/{AGENT_VERSION} (Home Assistant add-on)",
                    "Content-Type": "application/json", "X-Agent-Protocol": str(PROTOCOL),
@@ -90,12 +131,21 @@ class Link:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(base + path, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode() or "{}")
+            with _opener.open(req, timeout=timeout) as r:
+                raw = r.read(MAX_RESPONSE + 1)
+                if len(raw) > MAX_RESPONSE:
+                    raise ServerError(0, "risposta del server troppo grande", from_server=False)
+                data = json.loads(raw.decode() or "{}")
+                if not isinstance(data, dict):
+                    raise ServerError(0, "risposta del server non valida", from_server=False)
+                return data
         except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")
+            if 300 <= e.code < 400:
+                raise ServerError(e.code, f"il server ha risposto con un {e.reason}: usa direttamente "
+                                          "l'indirizzo finale (con https://) nella configurazione", from_server=False) from e
+            body = (e.read(64 * 1024) if e.fp else b"").decode(errors="replace")
             try:
-                message = json.loads(body).get("error") or str(e.reason)
+                message = str(json.loads(body).get("error") or e.reason)[:300]
                 from_server = True
             except (ValueError, AttributeError):
                 from_server = False
@@ -114,7 +164,9 @@ class Link:
         res = self._request("POST", "/api/agent/pair", {
             "code": code, "ha_version": ha_version, "agent_version": AGENT_VERSION, "location_name": location_name,
         }, auth=False, base=server_url)
-        self.state.update(server_url=server_url.rstrip("/"), plant_id=res["plant_id"], token=res["token"],
+        if not isinstance(res.get("token"), str) or not res["token"]:
+            raise ServerError(0, "risposta di abbinamento non valida", from_server=False)
+        self.state.update(server_url=server_url.rstrip("/"), plant_id=res.get("plant_id"), token=res["token"],
                           server_name=res.get("server_name"), brand_color=res.get("brand_color"), paired_code=code, connection="collegato",
                           last_error=None)
         return res
@@ -127,20 +179,23 @@ class Link:
         if diagnostics is not None:
             body["diagnostics"] = diagnostics
         res = self._request("POST", "/api/agent/report", body)
-        branding = {k: res[k] for k in ("server_name", "brand_color") if res.get(k) and res[k] != self.state.get(k)}
+        branding = {k: str(res[k])[:100] for k in ("server_name", "brand_color")
+                    if isinstance(res.get(k), str) and res[k] and res[k] != self.state.get(k)}
         if branding:
             self.state.update(**branding)
         return res
 
     def poll_commands(self, wait=25):
-        return self._request("GET", f"/api/agent/commands?wait={wait}", timeout=wait + 15).get("commands", [])
+        cmds = self._request("GET", f"/api/agent/commands?wait={wait}", timeout=wait + 15).get("commands")
+        return [c for c in cmds if isinstance(c, dict) and isinstance(c.get("id"), int)] if isinstance(cmds, list) else []
 
     def command_result(self, cid, ok, result=None, error=None):
         body = {"ok": ok, "result": result} if ok else {"ok": False, "error": error}
         return self._request("POST", f"/api/agent/commands/{cid}/result", body)
 
     def tickets(self):
-        return self._request("GET", "/api/agent/tickets").get("tickets", [])
+        tickets = self._request("GET", "/api/agent/tickets").get("tickets")
+        return tickets if isinstance(tickets, list) else []
 
     def open_ticket(self, title, description, contact, diagnostics):
         return self._request("POST", "/api/agent/tickets", {
