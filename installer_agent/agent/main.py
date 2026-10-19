@@ -122,7 +122,7 @@ class Agent:
                 continue
             diag = None
             due = time.monotonic() - self._last_diag_time >= self.options["diagnostics_minutes"] * 60
-            if self.state.get("consent") and due:
+            if self.state.consent_active() and due:
                 try:
                     diag = self.fresh_diagnostics()
                 except ha.HAError as e:
@@ -150,7 +150,7 @@ class Agent:
             return False, None, f"comando «{name}» non permesso da questo agente"
         if name == "ping":
             return True, {"agent_version": AGENT_VERSION, "ha_version": self.ha_version(), "time": time.time()}, None
-        if not self.state.get("consent"):
+        if not self.state.consent_active():
             return False, None, "accesso remoto sospeso dal cliente"
         if name == "run_diagnostics":
             return True, self.fresh_diagnostics(), None
@@ -183,6 +183,10 @@ class Agent:
 
     def run(self):
         log.info("Agente Assistenza %s in avvio", AGENT_VERSION)
+        if ha.TOKEN:
+            log.info("Chiave del Supervisor trovata (%s)", ha.TOKEN_SOURCE)
+        else:
+            log.error("Chiave del Supervisor NON trovata: la diagnostica non potrà leggere Home Assistant")
         Panel(self, int(os.environ.get("PANEL_PORT", "8099"))).start()
         threading.Thread(target=self.report_loop, daemon=True, name="report").start()
         threading.Thread(target=self.command_loop, daemon=True, name="commands").start()

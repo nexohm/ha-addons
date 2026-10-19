@@ -3,10 +3,12 @@ import json
 import logging
 import os
 import threading
+import time
+from datetime import datetime, timezone
 import urllib.error
 import urllib.request
 
-AGENT_VERSION = "0.1.1"
+AGENT_VERSION = "0.1.3"
 PROTOCOL = 1
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
@@ -19,7 +21,7 @@ class State:
 
     DEFAULTS = {
         "server_url": None, "plant_id": None, "token": None, "server_name": None, "brand_color": None, "paired_code": None,
-        "consent": True, "connection": "non_configurato", "last_error": None, "last_contact": None,
+        "consent": True, "consent_until": None, "connection": "non_configurato", "last_error": None, "last_contact": None,
         "last_diag": None,
     }
 
@@ -43,6 +45,21 @@ class State:
             with open(tmp, "w") as f:
                 json.dump(self._data, f)
             os.replace(tmp, STATE_PATH)
+
+    def consent_active(self):
+        """Consenso del cliente, tenendo conto della scadenza scelta: se è scaduta lo spegne."""
+        with self._lock:
+            consent, until = self._data.get("consent"), self._data.get("consent_until")
+        if consent and until and time.time() >= until:
+            log.info("Accesso remoto scaduto: sospeso automaticamente")
+            self.update(consent=False, consent_until=None)
+            return False
+        return bool(consent)
+
+    def set_consent(self, enabled, hours=None):
+        """hours=None: senza scadenza."""
+        until = time.time() + hours * 3600 if enabled and hours else None
+        self.update(consent=bool(enabled), consent_until=until)
 
     def snapshot(self):
         with self._lock:
@@ -103,7 +120,10 @@ class Link:
         return res
 
     def report(self, ha_version=None, diagnostics=None):
-        body = {"consent": bool(self.state.get("consent")), "ha_version": ha_version}
+        consent = self.state.consent_active()
+        until = self.state.get("consent_until") if consent else None
+        body = {"consent": consent, "ha_version": ha_version,
+                "consent_until": datetime.fromtimestamp(until, timezone.utc).isoformat(timespec="seconds") if until else None}
         if diagnostics is not None:
             body["diagnostics"] = diagnostics
         res = self._request("POST", "/api/agent/report", body)

@@ -46,7 +46,7 @@ main{max-width:860px;margin:0 auto;padding:24px 16px 48px}h1{font-size:1.4rem;ma
 .ok{color:var(--ok);background:var(--okb)}.attenzione,.in_lavorazione{color:var(--warn);background:var(--warnb)}
 .critico,.bad,.aperto{color:var(--bad);background:var(--badb)}.off{color:var(--off);background:var(--offb)}.chiuso{color:var(--ok);background:var(--okb)}
 label{display:block;font-weight:600;font-size:.88rem;margin:12px 0 5px}
-input,textarea{width:100%;font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
+input,textarea,select{width:100%;font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
 textarea{min-height:100px;resize:vertical}
 .btn{font:inherit;font-weight:600;border:1px solid transparent;border-radius:8px;padding:8px 14px;cursor:pointer;background:var(--brand);color:#fff}
 .btn.ghost{background:transparent;color:var(--ink);border-color:var(--line)}
@@ -56,6 +56,18 @@ textarea{min-height:100px;resize:vertical}
 details{border-top:1px solid var(--line);padding:12px 0}details:first-of-type{border-top:0}summary{cursor:pointer}
 ul{margin:6px 0 0;padding-left:20px}.flash{border-left:4px solid var(--brand);background:var(--panel);border-radius:8px;padding:10px 14px;margin-top:16px}
 """
+
+
+# Durate tra cui il cliente sceglie quando attiva l'accesso remoto (ore; None = senza scadenza)
+DURATIONS = {"1h": 1, "4h": 4, "24h": 24, "7g": 24 * 7, "sempre": None}
+DURATION_LABELS = [("1h", "1 ora"), ("4h", "4 ore"), ("24h", "24 ore"), ("7g", "7 giorni"), ("sempre", "Senza scadenza")]
+
+
+def fmt_epoch(ts):
+    try:
+        return datetime.fromtimestamp(float(ts)).strftime("%d/%m/%Y alle %H:%M")
+    except (TypeError, ValueError):
+        return "—"
 
 
 def esc(value):
@@ -121,15 +133,19 @@ class Panel:
         try:
             if action == "consenso":
                 enabled = form.get("enabled") == "1"
-                state.update(consent=enabled)
+                hours = DURATIONS.get(form.get("durata", "sempre"))
+                state.set_consent(enabled, hours)
                 agent.wake()
-                return "Accesso remoto dell'installatore attivato." if enabled else \
-                    "Accesso remoto sospeso: l'installatore vede solo se l'impianto è online."
+                if not enabled:
+                    return "Accesso remoto sospeso: l'installatore vede solo se l'impianto è online."
+                if hours:
+                    return f"Accesso remoto attivato fino al {fmt_epoch(state.get('consent_until'))}."
+                return "Accesso remoto attivato, senza scadenza."
             if action == "ticket":
                 title = form.get("title", "").strip()
                 if not title:
                     return "Scrivi almeno un titolo per la richiesta."
-                diag = agent.fresh_diagnostics() if state.get("consent") else None
+                diag = agent.fresh_diagnostics() if state.consent_active() else None
                 agent.link.open_ticket(title, form.get("description", "").strip(), form.get("contact", "").strip(), diag)
                 return "Richiesta inviata. Riceverai la risposta qui."
             if action == "rispondi":
@@ -194,11 +210,22 @@ class Panel:
                          f'<span class="muted small">controllato il {fmt(diag.get("collected_at"))}</span></p>'
                          + (f"<ul>{items}</ul>" if items else ""))
 
-        consent = s.get("consent")
-        consent_html = (
-            f'<form method="post" action="consenso" class="row"><input type="hidden" name="enabled" value="{"0" if consent else "1"}">'
-            f'<span style="flex:1">{"L&#39;installatore può controllare lo stato dell&#39;impianto ed eseguire verifiche a distanza." if consent else "Accesso remoto <b>sospeso</b>: l&#39;installatore vede solo se l&#39;impianto è acceso."}</span>'
-            f'<button class="btn {"ghost" if consent else ""}">{"Sospendi" if consent else "Riattiva"}</button></form>')
+        consent = self.agent.state.consent_active()
+        until = self.agent.state.get("consent_until")
+        if consent:
+            when = f"fino al <b>{fmt_epoch(until)}</b>" if until else "<b>senza scadenza</b>"
+            consent_html = (
+                f'<form method="post" action="consenso" class="row"><input type="hidden" name="enabled" value="0">'
+                f'<span style="flex:1">L&#39;installatore può controllare lo stato dell&#39;impianto ed eseguire verifiche '
+                f'a distanza, {when}.</span><button class="btn ghost">Sospendi</button></form>')
+        else:
+            options = "".join(f'<option value="{k}"{" selected" if k == "24h" else ""}>{l}</option>'
+                              for k, l in DURATION_LABELS)
+            consent_html = (
+                '<p style="margin:0 0 10px">Accesso remoto <b>sospeso</b>: l&#39;installatore vede solo se l&#39;impianto è acceso.</p>'
+                '<form method="post" action="consenso" class="row"><input type="hidden" name="enabled" value="1">'
+                f'<label for="durata" style="margin:0">Attiva per</label><select id="durata" name="durata" style="width:auto">{options}</select>'
+                '<button class="btn">Attiva</button></form>')
 
         error_html = ""
         if s.get("connection") in ("errore", "non_configurato", "aggiornare", "revocato"):
