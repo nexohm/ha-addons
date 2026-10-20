@@ -1,5 +1,5 @@
-name: Agente Assistenza
-version: "0.1.7"
+name: Agente Assistenza (prova)
+version: "0.1.8-dev1"
 slug: installer_agent
 description: Collega questo Home Assistant al servizio di assistenza del tuo installatore
 url: https://github.com/nexohm/ha-addons
@@ -18,7 +18,7 @@ boot: auto
 ingress: true
 ingress_port: 8099
 panel_icon: mdi:face-agent
-panel_title: Assistenza
+panel_title: Assistenza (prova)
 # Lettura di stati e configurazione di Home Assistant
 homeassistant_api: true
 # Lettura di info sistema, disco e backup dal Supervisor

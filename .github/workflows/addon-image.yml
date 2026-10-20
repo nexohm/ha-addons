@@ -37,6 +37,16 @@ jobs:
           if [[ "$GITHUB_REF" != refs/heads/sviluppo && "$version" == *-dev* ]]; then
             echo "::error::La versione $version è di prova: prima del merge va impostata la versione definitiva"; exit 1
           fi
+          # La versione dichiarata dall'agente deve coincidere con quella dell'add-on
+          agent=$(sed -n 's/^AGENT_VERSION = "\(.*\)"/\1/p' installer_agent/agent/link.py)
+          if [[ "$agent" != "$version" ]]; then
+            echo "::error::AGENT_VERSION in link.py ($agent) diversa da config.yaml ($version)"; exit 1
+          fi
+          # Il nome "(prova)" serve solo alle versioni di prova
+          name=$(python3 -c "import yaml;print(yaml.safe_load(open('installer_agent/config.yaml'))['name'])")
+          if [[ "$version" != *-dev* && "$name" == *prova* ]]; then
+            echo "::error::Versione definitiva con il nome di prova ($name): rimettere il nome normale"; exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           [[ "$version" == *-dev* ]] && echo "latest=false" >> "$GITHUB_OUTPUT" || echo "latest=true" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/$owner/${{ matrix.arch }}-addon-installer_agent" >> "$GITHUB_OUTPUT"
