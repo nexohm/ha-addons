@@ -75,7 +75,11 @@ class Agent:
 
     def fresh_diagnostics(self):
         with self._diag_lock:
-            diag = diagnostics.collect(self.state.get("excluded") or [])
+            only = self.state.get("only_labels") or []
+            # Se il filtro per etichette non si può applicare, meglio nessun controllo che mostrare
+            # all'installatore entità che il cliente ha escluso: ha.HAError ferma questo giro.
+            labels_of = ha.entity_labels() if only else None
+            diag = diagnostics.collect(self.state.get("excluded") or [], only, labels_of)
             flagged = diag.pop("_flagged", [])   # solo per il pannello del cliente, non va al server
             self._last_diag_time = time.monotonic()
             self.state.update(last_diag=diag, flagged=flagged)

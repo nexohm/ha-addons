@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-AGENT_VERSION = "0.1.8-dev1"
+AGENT_VERSION = "0.1.8-dev2"
 PROTOCOL = 1
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
@@ -62,7 +62,7 @@ class State:
         "consent": True, "consent_until": None, "connection": "non_configurato", "last_error": None, "last_contact": None,
         "last_diag": None,
         # scelte del cliente nel pannello
-        "excluded": [], "flagged": [],
+        "excluded": [], "only_labels": [], "flagged": [],
         "ticket_retention": {"days": None, "max_closed": None},
         "notify": {"ha": True, "services": []},
         "tickets_seen": None, "tickets_updated": None,

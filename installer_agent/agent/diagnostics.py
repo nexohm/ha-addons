@@ -44,9 +44,10 @@ def is_excluded(entity_id, patterns):
     return any(fnmatch.fnmatchcase(entity_id, p) for p in patterns)
 
 
-def collect(excluded=()):
+def collect(excluded=(), only_labels=None, labels_of=None):
     """Diagnostica da mandare al server. Le entità escluse dal cliente non vengono controllate né
-    nominate. La chiave interna "_flagged" (entità segnalate, per il pannello del cliente) va
+    nominate; con only_labels vengono controllate solo le entità che hanno almeno una di quelle
+    etichette (labels_of: {entity_id: {etichette}}). La chiave interna "_flagged" (entità segnalate, per il pannello del cliente) va
     tolta prima dell'invio: la toglie Agent.fresh_diagnostics."""
     now = datetime.now(timezone.utc)
     issues = []
@@ -65,6 +66,10 @@ def collect(excluded=()):
     for s in all_states:
         eid = s["entity_id"]
         if excluded and is_excluded(eid, excluded):
+            excluded_count += 1
+            continue
+        # "Controlla solo le entità con queste etichette" (dell'entità o del suo dispositivo)
+        if only_labels and not (labels_of.get(eid, set()) & set(only_labels)):
             excluded_count += 1
             continue
         domain = eid.split(".", 1)[0]

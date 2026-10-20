@@ -9,6 +9,7 @@ import logging
 import os
 import secrets
 import threading
+import time
 import urllib.parse
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -70,6 +71,12 @@ box-shadow:0 12px 32px rgba(0,0,0,.2);font-weight:600;animation:tin .35s cubic-b
 @media(prefers-reduced-motion:reduce){.toast,.toast.err{animation:tout .3s ease-in 6s forwards}.toast .ring,.toast .mark{animation:none;stroke-dashoffset:0}}
 .list{list-style:none;padding:0;margin:8px 0 0}.list li{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--line)}
 .list li:first-child{border-top:0}.list .grow{flex:1;min-width:0}.list code{font-size:.8rem;color:var(--muted);word-break:break-all}
+.tabs{display:flex;gap:4px;margin-top:18px;border-bottom:1px solid var(--line);overflow-x:auto}
+.tabs a{padding:9px 14px;color:var(--muted);text-decoration:none;font-weight:600;border-bottom:3px solid transparent;margin-bottom:-1px;white-space:nowrap}
+.tabs a:hover{color:var(--ink)}.tabs a.on{color:var(--ink);border-bottom-color:var(--brand)}
+.tabs .n{display:inline-block;min-width:20px;padding:0 6px;margin-left:6px;border-radius:999px;font-size:.75rem;background:var(--brand);color:#fff;text-align:center}
+.card:target,details:target{scroll-margin-top:12px}
+details.card{border-top:1px solid var(--line);padding:18px}details.card summary{font-size:1.02rem}
 .btn.small{padding:4px 10px;font-size:.85rem}.check{display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0}.check input{width:auto}
 """
 
@@ -92,6 +99,16 @@ MAX_EXCLUDED = 200
 # Richieste chiuse da mostrare (la cronologia completa resta all'installatore)
 RETENTION_DAYS = {"7": "7 giorni", "30": "30 giorni", "90": "90 giorni"}
 RETENTION_KEEP = {"3": "3", "5": "5", "10": "10", "20": "20"}
+
+# Schede del pannello e, per ogni azione, dove tornare dopo il salvataggio (scheda#punto):
+# la pagina riparte dalla sezione appena usata invece che dall'inizio.
+SECTIONS = [("richieste", "Richieste"), ("impianto", "Impianto"), ("preferenze", "Preferenze")]
+RETURN_TO = {
+    "ticket": "richieste#richieste", "richieste": "preferenze#lista", "notifiche": "preferenze#notifiche",
+    "consenso": "impianto#accesso", "diagnostica": "impianto#stato", "escludi": "impianto#entita",
+    "includi": "impianto#escluse", "etichette": "impianto#etichette",
+}
+MAX_LABELS = 50
 
 # Durate tra cui il cliente sceglie quando attiva l'accesso remoto (ore; None = senza scadenza)
 DURATIONS = {"1h": 1, "4h": 4, "24h": 24, "7g": 24 * 7, "sempre": None}
@@ -173,8 +190,9 @@ class Panel:
 
             def do_GET(self):
                 if self._allowed():
+                    query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                     try:
-                        body = panel.page().encode()
+                        body = panel.page((query.get("s") or [""])[0]).encode()
                     except Exception:  # noqa: BLE001 — il pannello non deve mai cadere
                         log.exception("errore nel pannello")
                         body = b"<!doctype html><meta charset=utf-8><p>Errore nel pannello: riprova tra poco.</p>"
@@ -198,14 +216,20 @@ class Panel:
                 raw = self.rfile.read(length).decode(errors="replace")
                 form = {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
                 form_lists = urllib.parse.parse_qs(raw)  # campi ripetuti (caselle di spunta)
+                action = urllib.parse.urlsplit(self.path).path.rsplit("/", 1)[-1]
                 if not secrets.compare_digest(form.get("csrf", ""), panel.csrf):
                     panel.flash = ("Pagina scaduta: riprova.", True)
                 else:
-                    result = panel.handle(self.path.rsplit("/", 1)[-1], form, form_lists)
+                    result = panel.handle(action, form, form_lists)
                     panel.flash = result if isinstance(result, tuple) or result is None else (result, False)
-                # Torna alla pagina principale con un percorso relativo (compatibile con l'ingress).
+                # Torna alla scheda e al punto della pagina da cui si è partiti, con un percorso
+                # relativo (compatibile con l'ingress).
+                target = RETURN_TO.get(action, "richieste")
+                if action == "rispondi" and form.get("tid", "").isdigit():
+                    target = f"richieste#t{form['tid']}"
+                section, _, anchor = target.partition("#")
                 self.send_response(303)
-                self.send_header("Location", "./")
+                self.send_header("Location", f"./?s={section}" + (f"#{anchor}" if anchor else ""))
                 self._security_headers()
                 self.end_headers()
 
@@ -233,6 +257,16 @@ class Panel:
                 state.update(excluded=excluded + [pattern])
                 self._refresh_diagnostics()
                 return f"{pattern} non verrà più controllata dall'installatore."
+            if action == "etichette":
+                known = self._labels()
+                chosen = [l for l in lists.get("label", []) if l in known][:MAX_LABELS]
+                if form.get("reset") == "1":
+                    chosen = []
+                state.update(only_labels=chosen)
+                self._refresh_diagnostics()
+                if chosen:
+                    return "L'installatore controllerà solo le entità con le etichette: " + ", ".join(known[l] for l in chosen) + "."
+                return "L'installatore controlla di nuovo tutte le entità (tranne quelle escluse)."
             if action == "includi":
                 pattern = form.get("entity", "")
                 state.update(excluded=[p for p in state.get("excluded") or [] if p != pattern])
@@ -294,6 +328,20 @@ class Panel:
             log.warning("Controllo dopo la modifica delle esclusioni non riuscito")
         self.agent.send_diagnostics_soon()
 
+    def _labels(self):
+        """Etichette di Home Assistant (lette al massimo una volta al minuto)."""
+        now = time.monotonic()
+        cached = getattr(self, "_labels_cache", None)
+        if cached and now - cached[0] < 60:
+            return cached[1]
+        try:
+            labels = ha.labels()
+        except ha.HAError as e:
+            log.warning("Etichette non lette: %s", e)
+            labels = cached[1] if cached else {}
+        self._labels_cache = (now, labels)
+        return labels
+
     def _notify_services(self):
         try:
             return ha.notify_services()
@@ -329,14 +377,14 @@ class Panel:
                      f'{"Tu" if mine else esc(m.get("author_name"))} · {fmt(m.get("created_at"))}</div>'
                      f'<p>{esc(m.get("text"))}</p></div>')
         badge = status if status in TICKET_LABELS else "off"
-        return (f'<details{" open" if status != "chiuso" else ""}><summary><b>{esc(t.get("title"))}</b> '
+        return (f'<details id="t{t["id"]}"{" open" if status != "chiuso" else ""}><summary><b>{esc(t.get("title"))}</b> '
                 f'<span class="badge {badge}">{esc(TICKET_LABELS.get(status, status))}</span> '
                 f'<span class="muted small">{fmt(t.get("updated_at"))}</span></summary>{msgs}'
                 f'<form method="post" action="rispondi" class="row" style="margin-top:10px">{self._hidden()}'
                 f'<input type="hidden" name="tid" value="{t["id"]}"><input name="text" placeholder="Aggiungi un messaggio" style="flex:1">'
                 f'<button class="btn ghost">Invia</button></form></details>')
 
-    def page(self):
+    def page(self, section=""):
         s = self.agent.state.snapshot()
         name = s.get("server_name") or "Assistenza"
         conn_label, conn_cls = CONNECTION_LABELS.get(s.get("connection"), ("Sconosciuto", "off"))
@@ -344,39 +392,75 @@ class Panel:
         flash, self.flash = self.flash, None
         color = s.get("brand_color") or ""
         brand_css = f"<style>:root{{--brand:{color}}}</style>" if re.fullmatch(r"#[0-9a-fA-F]{6}", color) else ""
+        if section not in dict(SECTIONS):
+            section = "richieste" if paired else "impianto"
 
-        tickets_html = ""
+        # ---- richieste (servono anche per il numero sulla scheda) ----
+        tickets, tickets_error = None, ""
         if paired:
             try:
                 tickets = self.agent.link.tickets()
             except ServerError as e:
-                tickets = None
                 if e.status in (401, 426):
                     self.agent._handle_server_error(e)
-                    return self.page()  # ridisegna con lo stato aggiornato (revocato / da aggiornare)
-                tickets_html = f'<p class="muted">Richieste non disponibili: {esc(e)}</p>'
-            if tickets is not None:
-                shown, hidden = filter_tickets(tickets, s.get("ticket_retention"))
-                for tk in shown:
-                    tickets_html += self._ticket_html(tk)
-                if not tickets:
-                    tickets_html = '<p class="muted">Nessuna richiesta finora.</p>'
-                elif hidden:
-                    tickets_html += (f'<p class="muted small">{hidden} richiest{"a chiusa nascosta" if hidden == 1 else "e chiuse nascoste"} '
-                                     'secondo le tue preferenze. L&#39;installatore ne conserva comunque lo storico.</p>')
-                ret = s.get("ticket_retention") or {}
-                def opt(options, current, first):
-                    return f'<option value="">{first}</option>' + "".join(
-                        f'<option value="{k}"{" selected" if str(current) == k else ""}>{v}</option>' for k, v in options.items())
-                tickets_html += (
-                    f'<details><summary class="small">Quali richieste chiuse mostrare</summary>'
-                    f'<form method="post" action="richieste" class="row" style="margin-top:8px">{self._hidden()}'
-                    f'<label style="margin:0">Chiuse negli ultimi</label><select name="days" style="width:auto">'
-                    f'{opt(RETENTION_DAYS, ret.get("days"), "sempre")}</select>'
-                    f'<label style="margin:0">al massimo</label><select name="max_closed" style="width:auto">'
-                    f'{opt(RETENTION_KEEP, ret.get("max_closed"), "tutte")}</select>'
-                    f'<button class="btn ghost small">Salva</button></form></details>')
+                    return self.page(section)  # ridisegna con lo stato aggiornato (revocato / da aggiornare)
+                tickets_error = f'<p class="muted">Richieste non disponibili: {esc(e)}</p>'
+        open_count = sum(1 for t in tickets or [] if isinstance(t, dict) and t.get("status") != "chiuso")
 
+        error_html = ""
+        if s.get("connection") in ("errore", "non_configurato", "aggiornare", "revocato"):
+            hint = s.get("last_error") or "Inserisci indirizzo del server e codice di abbinamento nella configurazione dell'add-on."
+            error_html = f'<div class="card"><h2>Collegamento</h2><p style="margin:0">{esc(hint)}</p></div>'
+
+        if not paired:
+            body = self._section_impianto(s, paired)
+            tabs = ""
+        else:
+            body = {"richieste": lambda: self._section_richieste(s, tickets, tickets_error, open_count),
+                    "impianto": lambda: self._section_impianto(s, paired),
+                    "preferenze": lambda: self._section_preferenze(s)}[section]()
+            tabs = '<nav class="tabs">' + "".join(
+                f'<a href="./?s={k}"{" class=on" if k == section else ""}>{l}'
+                + (f'<span class="n">{open_count}</span>' if k == "richieste" and open_count else "") + "</a>"
+                for k, l in SECTIONS) + "</nav>"
+
+        return f"""<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{esc(name)}</title><style>{CSS}</style>{brand_css}</head><body><main>
+<div class="head"><div><p class="muted small" style="margin:0">Assistenza impianto</p><h1>{esc(name)}</h1></div>
+<span class="badge {conn_cls}">{conn_label}</span></div>
+{tabs}
+{self._toast(flash)}
+{error_html}
+{body}
+</main></body></html>"""
+
+    # ---- schede ----
+
+    def _section_richieste(self, s, tickets, tickets_error, open_count):
+        consent = self.agent.state.consent_active()
+        tickets_html = tickets_error
+        if tickets is not None:
+            shown, hidden = filter_tickets(tickets, s.get("ticket_retention"))
+            # prima le aperte, poi le chiuse (ognuna già in ordine di aggiornamento dal server)
+            shown.sort(key=lambda t: isinstance(t, dict) and t.get("status") == "chiuso")
+            tickets_html += "".join(self._ticket_html(tk) for tk in shown)
+            if not tickets:
+                tickets_html = '<p class="muted">Nessuna richiesta finora.</p>'
+            elif hidden:
+                tickets_html += (f'<p class="muted small">{hidden} richiest{"a chiusa nascosta" if hidden == 1 else "e chiuse nascoste"} '
+                                 'secondo le tue <a href="./?s=preferenze#lista">preferenze</a>. '
+                                 'L&#39;installatore ne conserva comunque lo storico.</p>')
+        # Il modulo per una nuova richiesta resta chiuso se ce n'è già una in corso: la pagina è più corta.
+        new_form = f"""<details class="card" id="nuova"{"" if open_count else " open"}><summary><b>+ Nuova richiesta di assistenza</b></summary>
+<form method="post" action="ticket">{self._hidden()}<label for="title">Qual è il problema?</label>
+<input id="title" name="title" required placeholder="Es. le luci del giardino non si accendono">
+<label for="description">Descrizione</label><textarea id="description" name="description" placeholder="Da quando succede, cosa hai già provato..."></textarea>
+<label for="contact">Come ti ricontattiamo? (facoltativo)</label><input id="contact" name="contact" placeholder="Telefono o email">
+<p class="muted small">{"Alla richiesta viene allegato un controllo automatico dell&#39;impianto." if consent else ""}</p>
+<button class="btn">Invia richiesta</button></form></details>"""
+        return f'{new_form}<div class="card" id="richieste"><h2>Le tue richieste</h2>{tickets_html}</div>'
+
+    def _section_impianto(self, s, paired):
         diag = s.get("last_diag") or {}
         diag_html = '<p class="muted">Nessun controllo eseguito.</p>'
         if diag:
@@ -386,6 +470,11 @@ class Panel:
             diag_html = (f'<p><span class="badge {esc(st)}">{esc(STATUS_LABELS.get(st, st))}</span> '
                          f'<span class="muted small">controllato il {fmt(diag.get("collected_at"))}</span></p>'
                          + (f"<ul>{items}</ul>" if items else ""))
+        out = (f'<div class="card" id="stato"><div class="head"><h2>Stato dell&#39;impianto</h2>'
+               f'<form method="post" action="diagnostica">{self._hidden()}<button class="btn ghost">Controlla ora</button></form></div>'
+               f'{diag_html}</div>')
+        if not paired:
+            return out
 
         consent = self.agent.state.consent_active()
         until = self.agent.state.get("consent_until")
@@ -403,39 +492,59 @@ class Panel:
                 f'<form method="post" action="consenso" class="row">{self._hidden()}<input type="hidden" name="enabled" value="1">'
                 f'<label for="durata" style="margin:0">Attiva per</label><select id="durata" name="durata" style="width:auto">{options}</select>'
                 '<button class="btn">Attiva</button></form>')
+        out += f'<div class="card" id="accesso"><h2>Accesso remoto</h2>{consent_html}</div>'
 
-        entities_html = ""
-        if paired:
-            excluded = s.get("excluded") or []
-            flagged = [f for f in (s.get("flagged") or []) if isinstance(f, dict)]
-            rows = "".join(
-                f'<li><span class="grow">{esc(f.get("name"))} <span class="muted small">· {esc(f.get("reason"))}</span>'
-                f'<br><code>{esc(f.get("entity_id"))}</code></span>'
-                f'<form method="post" action="escludi">{self._hidden()}<input type="hidden" name="entity" value="{esc(f.get("entity_id"))}">'
-                f'<button class="btn ghost small">Non controllare</button></form></li>' for f in flagged[:50])
-            ex_rows = "".join(
-                f'<li><span class="grow"><code>{esc(p)}</code></span>'
-                f'<form method="post" action="includi">{self._hidden()}<input type="hidden" name="entity" value="{esc(p)}">'
-                f'<button class="btn ghost small">Controlla di nuovo</button></form></li>' for p in excluded)
-            entities_html = f"""<div class="card"><h2>Cosa controlla l'installatore</h2>
+        excluded = s.get("excluded") or []
+        flagged = [f for f in (s.get("flagged") or []) if isinstance(f, dict)]
+        rows = "".join(
+            f'<li><span class="grow">{esc(f.get("name"))} <span class="muted small">· {esc(f.get("reason"))}</span>'
+            f'<br><code>{esc(f.get("entity_id"))}</code></span>'
+            f'<form method="post" action="escludi">{self._hidden()}<input type="hidden" name="entity" value="{esc(f.get("entity_id"))}">'
+            f'<button class="btn ghost small">Non controllare</button></form></li>' for f in flagged[:50])
+        ex_rows = "".join(
+            f'<li><span class="grow"><code>{esc(p)}</code></span>'
+            f'<form method="post" action="includi">{self._hidden()}<input type="hidden" name="entity" value="{esc(p)}">'
+            f'<button class="btn ghost small">Controlla di nuovo</button></form></li>' for p in excluded)
+
+        labels = self._labels()
+        only = [l for l in s.get("only_labels") or []]
+        only_names = ", ".join(esc(labels.get(l, l)) for l in only)
+        if labels:
+            boxes = "".join(f'<label class="check"><input type="checkbox" name="label" value="{esc(k)}"{" checked" if k in only else ""}> {esc(v)}</label>'
+                            for k, v in sorted(labels.items(), key=lambda kv: str(kv[1]).lower()))
+            labels_form = (f'<form method="post" action="etichette" style="margin-top:8px">{self._hidden()}{boxes}'
+                           f'<div class="row" style="margin-top:8px"><button class="btn ghost small">Salva</button>'
+                           + (f'<button class="btn ghost small" name="reset" value="1">Controlla tutte</button>' if only else "")
+                           + '</div></form>')
+        else:
+            labels_form = ('<p class="muted small">Non hai ancora creato etichette in Home Assistant '
+                           '(Impostazioni → Aree, etichette e zone → Etichette).</p>')
+        labels_html = (f'<details id="etichette"{" open" if only else ""}><summary class="small">Controlla solo le entità con certe etichette'
+                       + (f' <b>· attivo: {only_names}</b>' if only else "") + '</summary>'
+                       '<p class="muted small" style="margin:8px 0 0">L&#39;installatore controllerà solo le entità che hanno almeno una delle '
+                       'etichette scelte (sull&#39;entità o sul suo dispositivo). Le altre non verranno controllate né nominate.</p>'
+                       f'{labels_form}</details>')
+
+        out += f"""<div class="card" id="entita"><h2>Cosa controlla l'installatore</h2>
 <p class="muted small" style="margin-top:0">Alcune entità segnalano sempre un problema anche se va tutto bene (la batteria del telefono,
 un robot spesso spento...). Puoi escluderle: l'installatore non le vedrà più e vedrà solo quante ne hai escluse.</p>
 {f'<p style="margin:12px 0 0"><b>Segnalate dall&#39;ultimo controllo</b></p><ul class="list">{rows}</ul>' if rows else '<p class="muted small">Nessuna entità segnalata dall&#39;ultimo controllo.</p>'}
-{f'<p style="margin:16px 0 0"><b>Escluse</b></p><ul class="list">{ex_rows}</ul>' if ex_rows else ''}
+{f'<div id="escluse"><p style="margin:16px 0 0"><b>Escluse</b></p><ul class="list">{ex_rows}</ul></div>' if ex_rows else ''}
 <details><summary class="small">Escludi un&#39;entità a mano</summary>
 <form method="post" action="escludi" class="row" style="margin-top:8px">{self._hidden()}
 <input name="entity" placeholder="es. sensor.telefono_batteria oppure vacuum.robot_*" style="flex:1" required>
-<button class="btn ghost small">Escludi</button></form></details></div>"""
+<button class="btn ghost small">Escludi</button></form></details>
+{labels_html}</div>"""
+        return out
 
-        notify_html = ""
-        if paired:
-            ns = s.get("notify") or {}
-            services = self._notify_services()
-            chosen = set(ns.get("services") or [])
-            svc_html = "".join(
-                f'<label class="check"><input type="checkbox" name="service" value="{esc(x)}"{" checked" if x in chosen else ""}> '
-                f'{esc(x.replace("mobile_app_", "App sul telefono: ").replace("_", " "))}</label>' for x in services)
-            notify_html = f"""<div class="card"><h2>Notifiche</h2>
+    def _section_preferenze(self, s):
+        ns = s.get("notify") or {}
+        services = self._notify_services()
+        chosen = set(ns.get("services") or [])
+        svc_html = "".join(
+            f'<label class="check"><input type="checkbox" name="service" value="{esc(x)}"{" checked" if x in chosen else ""}> '
+            f'{esc(x.replace("mobile_app_", "App sul telefono: ").replace("_", " "))}</label>' for x in services)
+        notify_html = f"""<div class="card" id="notifiche"><h2>Notifiche</h2>
 <p class="muted small" style="margin-top:0">Quando l&#39;installatore risponde o aggiorna una tua richiesta.</p>
 <form method="post" action="notifiche">{self._hidden()}
 <label class="check"><input type="checkbox" name="ha" value="1"{" checked" if ns.get("ha", True) else ""}> Nella campanella di Home Assistant</label>
@@ -443,32 +552,19 @@ un robot spesso spento...). Puoi escluderle: l'installatore non le vedrà più e
 <div class="row" style="margin-top:10px"><button class="btn ghost small">Salva</button>
 <button class="btn ghost small" name="prova" value="1">Salva e invia una prova</button></div></form></div>"""
 
-        error_html = ""
-        if s.get("connection") in ("errore", "non_configurato", "aggiornare", "revocato"):
-            hint = s.get("last_error") or "Inserisci indirizzo del server e codice di abbinamento nella configurazione dell'add-on."
-            error_html = f'<div class="card"><h2>Collegamento</h2><p style="margin:0">{esc(hint)}</p></div>'
+        ret = s.get("ticket_retention") or {}
 
-        ticket_form = ""
-        if paired:
-            ticket_form = f"""<div class="card"><h2>Chiedi assistenza</h2>
-<form method="post" action="ticket">{self._hidden()}<label for="title">Qual è il problema?</label>
-<input id="title" name="title" required placeholder="Es. le luci del giardino non si accendono">
-<label for="description">Descrizione</label><textarea id="description" name="description" placeholder="Da quando succede, cosa hai già provato..."></textarea>
-<label for="contact">Come ti ricontattiamo? (facoltativo)</label><input id="contact" name="contact" placeholder="Telefono o email">
-<p class="muted small">{"Alla richiesta viene allegato un controllo automatico dell&#39;impianto." if consent else ""}</p>
-<button class="btn">Invia richiesta</button></form></div>"""
-
-        return f"""<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{esc(name)}</title><style>{CSS}</style>{brand_css}</head><body><main>
-<div class="head"><div><p class="muted small" style="margin:0">Assistenza impianto</p><h1>{esc(name)}</h1></div>
-<span class="badge {conn_cls}">{conn_label}</span></div>
-{self._toast(flash)}
-{error_html}
-{ticket_form}
-{f'<div class="card"><h2>Le tue richieste</h2>{tickets_html}</div>' if paired else ""}
-<div class="card"><div class="head"><h2>Stato dell'impianto</h2>
-<form method="post" action="diagnostica">{self._hidden()}<button class="btn ghost">Controlla ora</button></form></div>{diag_html}</div>
-{f'<div class="card"><h2>Accesso remoto</h2>{consent_html}</div>' if paired else ""}
-{entities_html}
-{notify_html}
-</main></body></html>"""
+        def opt(options, current, first):
+            return f'<option value="">{first}</option>' + "".join(
+                f'<option value="{k}"{" selected" if str(current) == k else ""}>{v}</option>' for k, v in options.items())
+        list_html = (
+            f'<div class="card" id="lista"><h2>Richieste chiuse</h2>'
+            f'<p class="muted small" style="margin-top:0">Quali richieste già chiuse mostrare nella scheda Richieste. '
+            f'Quelle nascoste restano comunque nello storico dell&#39;installatore.</p>'
+            f'<form method="post" action="richieste" class="row">{self._hidden()}'
+            f'<label style="margin:0">Chiuse negli ultimi</label><select name="days" style="width:auto">'
+            f'{opt(RETENTION_DAYS, ret.get("days"), "sempre")}</select>'
+            f'<label style="margin:0">al massimo</label><select name="max_closed" style="width:auto">'
+            f'{opt(RETENTION_KEEP, ret.get("max_closed"), "tutte")}</select>'
+            f'<button class="btn ghost small">Salva</button></form></div>')
+        return notify_html + list_html
