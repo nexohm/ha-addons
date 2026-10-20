@@ -108,7 +108,7 @@ class Agent:
             return False
         try:
             res = self.link.pair(opts["server_url"], opts["pair_code"], self.ha_version(), self._location_name())
-            log.info("Abbinato a «%s» come impianto %s", res.get("server_name"), res["plant_id"])
+            log.info("Abbinato a «%s» come impianto %s", res.get("server_name"), res.get("plant_id"))
             self._last_diag_time = 0
             return True
         except ServerError as e:
