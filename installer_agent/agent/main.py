@@ -52,6 +52,16 @@ class Agent:
         """Forza un rapporto immediato (es. dopo un cambio di consenso)."""
         self._wake.set()
 
+    def ha_urls(self):
+        """Indirizzi di Home Assistant impostati dal cliente (Impostazioni → Sistema → Rete).
+        Il server li mostra all'installatore come pulsante "Apri Home Assistant"."""
+        try:
+            cfg = ha.config()
+        except ha.HAError:
+            return None
+        self._ha_version = cfg.get("version") or self._ha_version
+        return {"internal": cfg.get("internal_url"), "external": cfg.get("external_url")}
+
     def ha_version(self):
         if not self._ha_version:
             try:
@@ -98,7 +108,7 @@ class Agent:
             return False
         try:
             res = self.link.pair(opts["server_url"], opts["pair_code"], self.ha_version(), self._location_name())
-            log.info("Abbinato a «%s» come impianto %s", res.get("server_name"), res.get("plant_id"))
+            log.info("Abbinato a «%s» come impianto %s", res.get("server_name"), res["plant_id"])
             self._last_diag_time = 0
             return True
         except ServerError as e:
@@ -128,7 +138,8 @@ class Agent:
                 except ha.HAError as e:
                     log.warning("Diagnostica non riuscita: %s", e)
             try:
-                self.link.report(self.ha_version(), diag)
+                urls = self.ha_urls()
+                self.link.report(self.ha_version(), diag, urls)
                 self.state.update(connection="collegato", last_error=None, last_contact=time.time())
                 failures = 0
                 wait = self.options["heartbeat_seconds"]

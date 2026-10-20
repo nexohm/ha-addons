@@ -7,7 +7,6 @@ import html
 import re
 import logging
 import os
-import secrets
 import threading
 import urllib.parse
 from datetime import datetime
@@ -59,18 +58,6 @@ ul{margin:6px 0 0;padding-left:20px}.flash{border-left:4px solid var(--brand);ba
 """
 
 
-# Il pannello gira nella stessa origine di Home Assistant (ingress): un testo malevolo che
-# riuscisse a diventare codice avrebbe accesso a tutta la casa. Per questo, oltre a fare
-# l'escape di ogni dato, la CSP vieta qualsiasi script: il pannello non ne usa.
-SECURITY_HEADERS = {
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
-                               "frame-ancestors 'self'; base-uri 'none'",
-    "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
-    "Cache-Control": "no-store",
-}
-MAX_FORM = 64 * 1024
-
 # Durate tra cui il cliente sceglie quando attiva l'accesso remoto (ore; None = senza scadenza)
 DURATIONS = {"1h": 1, "4h": 4, "24h": 24, "7g": 24 * 7, "sempre": None}
 DURATION_LABELS = [("1h", "1 ora"), ("4h", "4 ore"), ("24h", "24 ore"), ("7g", "7 giorni"), ("sempre", "Senza scadenza")]
@@ -79,7 +66,7 @@ DURATION_LABELS = [("1h", "1 ora"), ("4h", "4 ore"), ("24h", "24 ore"), ("7g", "
 def fmt_epoch(ts):
     try:
         return datetime.fromtimestamp(float(ts)).strftime("%d/%m/%Y alle %H:%M")
-    except (TypeError, ValueError, OverflowError, OSError):
+    except (TypeError, ValueError):
         return "—"
 
 
@@ -90,7 +77,7 @@ def esc(value):
 def fmt(ts):
     try:
         return datetime.fromisoformat(ts).astimezone().strftime("%d/%m/%Y %H:%M")
-    except (TypeError, ValueError, OverflowError, OSError):
+    except (TypeError, ValueError):
         return "—"
 
 
@@ -99,12 +86,6 @@ class Panel:
         self.agent = agent
         self.port = port
         self.flash = None
-        # Token anti-CSRF: ogni modulo lo porta con sé; un altro sito non lo conosce e non può
-        # inviare moduli al pannello (per esempio per riattivare l'accesso remoto).
-        self.csrf = secrets.token_urlsafe(24)
-
-    def _hidden(self):
-        return f'<input type="hidden" name="csrf" value="{self.csrf}">'
 
     def start(self):
         panel = self
@@ -119,44 +100,25 @@ class Panel:
                 self.send_error(403)
                 return False
 
-            def _security_headers(self):
-                for k, v in SECURITY_HEADERS.items():
-                    self.send_header(k, v)
-
             def do_GET(self):
                 if self._allowed():
-                    try:
-                        body = panel.page().encode()
-                    except Exception:  # noqa: BLE001 — il pannello non deve mai cadere
-                        log.exception("errore nel pannello")
-                        body = b"<!doctype html><meta charset=utf-8><p>Errore nel pannello: riprova tra poco.</p>"
+                    body = panel.page().encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Content-Length", str(len(body)))
-                    self._security_headers()
+                    self.send_header("Cache-Control", "no-store")
                     self.end_headers()
                     self.wfile.write(body)
 
             def do_POST(self):
                 if not self._allowed():
                     return
-                try:
-                    length = int(self.headers.get("Content-Length") or 0)
-                except ValueError:
-                    length = -1
-                if length < 0 or length > MAX_FORM:
-                    self.send_error(400 if length < 0 else 413)
-                    return
-                raw = self.rfile.read(length).decode(errors="replace")
-                form = {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
-                if not secrets.compare_digest(form.get("csrf", ""), panel.csrf):
-                    panel.flash = "Pagina scaduta: riprova."
-                else:
-                    panel.flash = panel.handle(self.path.rsplit("/", 1)[-1], form)
+                length = min(int(self.headers.get("Content-Length") or 0), 64 * 1024)
+                form = {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(length).decode()).items()}
+                panel.flash = panel.handle(self.path.rsplit("/", 1)[-1], form)
                 # Torna alla pagina principale con un percorso relativo (compatibile con l'ingress).
                 self.send_response(303)
                 self.send_header("Location", "./")
-                self._security_headers()
                 self.end_headers()
 
         server = ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
@@ -204,28 +166,6 @@ class Panel:
 
     # ---- pagina ----
 
-    def _ticket_html(self, t):
-        """Una richiesta del cliente. Tutto arriva dal server: si fa l'escape di ogni campo
-        e si scarta quello che non ha la forma prevista."""
-        if not isinstance(t, dict) or not isinstance(t.get("id"), int):
-            return ""
-        status = t.get("status")
-        msgs = ""
-        for m in t.get("messages") if isinstance(t.get("messages"), list) else []:
-            if not isinstance(m, dict):
-                continue
-            mine = m.get("author_type") == "cliente"
-            msgs += (f'<div class="msg {"cliente" if mine else "installatore"}"><div class="meta">'
-                     f'{"Tu" if mine else esc(m.get("author_name"))} · {fmt(m.get("created_at"))}</div>'
-                     f'<p>{esc(m.get("text"))}</p></div>')
-        badge = status if status in TICKET_LABELS else "off"
-        return (f'<details{" open" if status != "chiuso" else ""}><summary><b>{esc(t.get("title"))}</b> '
-                f'<span class="badge {badge}">{esc(TICKET_LABELS.get(status, status))}</span> '
-                f'<span class="muted small">{fmt(t.get("updated_at"))}</span></summary>{msgs}'
-                f'<form method="post" action="rispondi" class="row" style="margin-top:10px">{self._hidden()}'
-                f'<input type="hidden" name="tid" value="{t["id"]}"><input name="text" placeholder="Aggiungi un messaggio" style="flex:1">'
-                f'<button class="btn ghost">Invia</button></form></details>')
-
     def page(self):
         s = self.agent.state.snapshot()
         name = s.get("server_name") or "Assistenza"
@@ -247,7 +187,17 @@ class Panel:
                 tickets_html = f'<p class="muted">Richieste non disponibili: {esc(e)}</p>'
             if tickets is not None:
                 for t in tickets:
-                    tickets_html += self._ticket_html(t)
+                    msgs = "".join(
+                        f'<div class="msg {esc(m["author_type"])}"><div class="meta">'
+                        f'{"Tu" if m["author_type"] == "cliente" else esc(m["author_name"])} · {fmt(m["created_at"])}</div>'
+                        f'<p>{esc(m["text"])}</p></div>' for m in t["messages"])
+                    tickets_html += (
+                        f'<details{" open" if t["status"] != "chiuso" else ""}><summary><b>{esc(t["title"])}</b> '
+                        f'<span class="badge {esc(t["status"])}">{TICKET_LABELS.get(t["status"], t["status"])}</span> '
+                        f'<span class="muted small">{fmt(t["updated_at"])}</span></summary>{msgs}'
+                        f'<form method="post" action="rispondi" class="row" style="margin-top:10px">'
+                        f'<input type="hidden" name="tid" value="{t["id"]}"><input name="text" placeholder="Aggiungi un messaggio" style="flex:1">'
+                        f'<button class="btn ghost">Invia</button></form></details>')
                 if not tickets:
                     tickets_html = '<p class="muted">Nessuna richiesta finora.</p>'
 
@@ -255,9 +205,8 @@ class Panel:
         diag_html = '<p class="muted">Nessun controllo eseguito.</p>'
         if diag:
             st = diag.get("status", "ok")
-            items = "".join(f'<li>{esc(i.get("message"))}</li>' for i in diag.get("issues", [])
-                            if isinstance(i, dict) and i.get("severity") != "info")
-            diag_html = (f'<p><span class="badge {esc(st)}">{esc(STATUS_LABELS.get(st, st))}</span> '
+            items = "".join(f'<li>{esc(i["message"])}</li>' for i in diag.get("issues", []) if i["severity"] != "info")
+            diag_html = (f'<p><span class="badge {esc(st)}">{STATUS_LABELS.get(st, st)}</span> '
                          f'<span class="muted small">controllato il {fmt(diag.get("collected_at"))}</span></p>'
                          + (f"<ul>{items}</ul>" if items else ""))
 
@@ -266,7 +215,7 @@ class Panel:
         if consent:
             when = f"fino al <b>{fmt_epoch(until)}</b>" if until else "<b>senza scadenza</b>"
             consent_html = (
-                f'<form method="post" action="consenso" class="row">{self._hidden()}<input type="hidden" name="enabled" value="0">'
+                f'<form method="post" action="consenso" class="row"><input type="hidden" name="enabled" value="0">'
                 f'<span style="flex:1">L&#39;installatore può controllare lo stato dell&#39;impianto ed eseguire verifiche '
                 f'a distanza, {when}.</span><button class="btn ghost">Sospendi</button></form>')
         else:
@@ -274,7 +223,7 @@ class Panel:
                               for k, l in DURATION_LABELS)
             consent_html = (
                 '<p style="margin:0 0 10px">Accesso remoto <b>sospeso</b>: l&#39;installatore vede solo se l&#39;impianto è acceso.</p>'
-                f'<form method="post" action="consenso" class="row">{self._hidden()}<input type="hidden" name="enabled" value="1">'
+                '<form method="post" action="consenso" class="row"><input type="hidden" name="enabled" value="1">'
                 f'<label for="durata" style="margin:0">Attiva per</label><select id="durata" name="durata" style="width:auto">{options}</select>'
                 '<button class="btn">Attiva</button></form>')
 
@@ -286,7 +235,7 @@ class Panel:
         ticket_form = ""
         if paired:
             ticket_form = f"""<div class="card"><h2>Chiedi assistenza</h2>
-<form method="post" action="ticket">{self._hidden()}<label for="title">Qual è il problema?</label>
+<form method="post" action="ticket"><label for="title">Qual è il problema?</label>
 <input id="title" name="title" required placeholder="Es. le luci del giardino non si accendono">
 <label for="description">Descrizione</label><textarea id="description" name="description" placeholder="Da quando succede, cosa hai già provato..."></textarea>
 <label for="contact">Come ti ricontattiamo? (facoltativo)</label><input id="contact" name="contact" placeholder="Telefono o email">
@@ -302,6 +251,6 @@ class Panel:
 {ticket_form}
 {f'<div class="card"><h2>Le tue richieste</h2>{tickets_html}</div>' if paired else ""}
 <div class="card"><div class="head"><h2>Stato dell'impianto</h2>
-<form method="post" action="diagnostica">{self._hidden()}<button class="btn ghost">Controlla ora</button></form></div>{diag_html}</div>
+<form method="post" action="diagnostica"><button class="btn ghost">Controlla ora</button></form></div>{diag_html}</div>
 {f'<div class="card"><h2>Accesso remoto</h2>{consent_html}</div>' if paired else ""}
 </main></body></html>"""

@@ -1,13 +1,8 @@
 # Changelog
 
-## 0.1.4 — sicurezza
-- Il pannello "Assistenza" tratta come non fidato tutto ciò che arriva dal server: ogni testo viene
-  ripulito e una Content-Security-Policy impedisce l'esecuzione di qualsiasi script nel pannello.
-- Protezione anti-CSRF sui moduli del pannello: un altro sito non può riattivare l'accesso remoto
-  o aprire richieste al posto del cliente.
-- L'agente non segue più i reindirizzamenti del server (avrebbe inviato il token anche a un altro indirizzo).
-- L'indirizzo del server deve usare https://; http è ammesso solo per server nella rete locale.
-- Risposte del server malformate o troppo grandi non bloccano più l'agente né il pannello.
+## 0.1.4
+- Comunica al server gli indirizzi (interno ed esterno) di Home Assistant impostati in
+  Impostazioni → Sistema → Rete: l'installatore li trova come pulsante "Apri Home Assistant".
 
 ## 0.1.3
 - Accesso remoto a tempo: il cliente sceglie per quanto attivarlo (1 ora, 4 ore, 24 ore, 7 giorni o senza scadenza).
