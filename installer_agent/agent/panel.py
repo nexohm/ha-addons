@@ -13,6 +13,7 @@ import urllib.parse
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import ha
 from .link import ServerError
 
 log = logging.getLogger("agent.panel")
@@ -55,7 +56,21 @@ textarea{min-height:100px;resize:vertical}
 .msg{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-top:8px}.msg.installatore{background:color-mix(in srgb,var(--brand) 9%,var(--panel))}
 .msg p{margin:0;white-space:pre-wrap}.meta{color:var(--muted);font-size:.8rem}
 details{border-top:1px solid var(--line);padding:12px 0}details:first-of-type{border-top:0}summary{cursor:pointer}
-ul{margin:6px 0 0;padding-left:20px}.flash{border-left:4px solid var(--brand);background:var(--panel);border-radius:8px;padding:10px 14px;margin-top:16px}
+ul{margin:6px 0 0;padding-left:20px}
+.toast{position:fixed;left:50%;bottom:20px;z-index:9;transform:translateX(-50%);display:flex;align-items:center;gap:12px;
+max-width:min(520px,calc(100vw - 32px));background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px 16px 12px 12px;
+box-shadow:0 12px 32px rgba(0,0,0,.2);font-weight:600;animation:tin .35s cubic-bezier(.2,.9,.3,1.2) both,tout .45s ease-in 4.6s forwards}
+.toast.err{animation:tin .35s cubic-bezier(.2,.9,.3,1.2) both,tshake .4s ease .75s,tout .45s ease-in 9s forwards}
+.toast svg{width:32px;height:32px;flex:0 0 32px}.toast .ring{fill:none;stroke-width:4;stroke-dasharray:145;stroke-dashoffset:145;animation:tdraw .5s ease-out .1s forwards}
+.toast .mark{fill:none;stroke-width:5;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:48;stroke-dashoffset:48;animation:tdraw .35s ease-out .55s forwards}
+.toast.ok .ring,.toast.ok .mark{stroke:var(--ok)}.toast.err .ring,.toast.err .mark{stroke:var(--bad)}
+@keyframes tin{from{opacity:0;transform:translate(-50%,24px) scale(.96)}to{opacity:1;transform:translate(-50%,0)}}
+@keyframes tout{to{opacity:0;transform:translate(-50%,16px);visibility:hidden}}@keyframes tdraw{to{stroke-dashoffset:0}}
+@keyframes tshake{0%,100%{transform:translateX(-50%)}20%,60%{transform:translateX(calc(-50% - 7px))}40%,80%{transform:translateX(calc(-50% + 7px))}}
+@media(prefers-reduced-motion:reduce){.toast,.toast.err{animation:tout .3s ease-in 6s forwards}.toast .ring,.toast .mark{animation:none;stroke-dashoffset:0}}
+.list{list-style:none;padding:0;margin:8px 0 0}.list li{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--line)}
+.list li:first-child{border-top:0}.list .grow{flex:1;min-width:0}.list code{font-size:.8rem;color:var(--muted);word-break:break-all}
+.btn.small{padding:4px 10px;font-size:.85rem}.check{display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0}.check input{width:auto}
 """
 
 
@@ -70,6 +85,13 @@ SECURITY_HEADERS = {
     "Cache-Control": "no-store",
 }
 MAX_FORM = 64 * 1024
+
+# Entità da non controllare: dominio.nome, con * per indicarne più di una (es. sensor.robot_*)
+ENTITY_PATTERN = re.compile(r"[a-z0-9_*]{1,60}\.[a-z0-9_*]{1,100}")
+MAX_EXCLUDED = 200
+# Richieste chiuse da mostrare (la cronologia completa resta all'installatore)
+RETENTION_DAYS = {"7": "7 giorni", "30": "30 giorni", "90": "90 giorni"}
+RETENTION_KEEP = {"3": "3", "5": "5", "10": "10", "20": "20"}
 
 # Durate tra cui il cliente sceglie quando attiva l'accesso remoto (ore; None = senza scadenza)
 DURATIONS = {"1h": 1, "4h": 4, "24h": 24, "7g": 24 * 7, "sempre": None}
@@ -92,6 +114,32 @@ def fmt(ts):
         return datetime.fromisoformat(ts).astimezone().strftime("%d/%m/%Y %H:%M")
     except (TypeError, ValueError, OverflowError, OSError):
         return "—"
+
+
+def filter_tickets(tickets, retention, now=None):
+    """Richieste da mostrare al cliente: tutte quelle aperte, e le chiuse entro i limiti scelti.
+    Restituisce (visibili, quante chiuse sono nascoste)."""
+    retention = retention or {}
+    days, keep = retention.get("days"), retention.get("max_closed")
+    now = now or datetime.now().astimezone()
+    visible, closed = [], []
+    for t in tickets:
+        if isinstance(t, dict) and t.get("status") == "chiuso":
+            closed.append(t)
+        else:
+            visible.append(t)
+    def ts(t):
+        try:
+            return datetime.fromisoformat(t.get("updated_at")).astimezone()
+        except (TypeError, ValueError):
+            return now
+    closed.sort(key=ts, reverse=True)
+    shown = [t for t in closed if not days or (now - ts(t)).days < days]
+    if keep:
+        shown = shown[:keep]
+    hidden = len(closed) - len(shown)
+    visible_ids = {id(t) for t in visible + shown}
+    return [t for t in tickets if id(t) in visible_ids], hidden
 
 
 class Panel:
@@ -149,10 +197,12 @@ class Panel:
                     return
                 raw = self.rfile.read(length).decode(errors="replace")
                 form = {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
+                form_lists = urllib.parse.parse_qs(raw)  # campi ripetuti (caselle di spunta)
                 if not secrets.compare_digest(form.get("csrf", ""), panel.csrf):
-                    panel.flash = "Pagina scaduta: riprova."
+                    panel.flash = ("Pagina scaduta: riprova.", True)
                 else:
-                    panel.flash = panel.handle(self.path.rsplit("/", 1)[-1], form)
+                    result = panel.handle(self.path.rsplit("/", 1)[-1], form, form_lists)
+                    panel.flash = result if isinstance(result, tuple) or result is None else (result, False)
                 # Torna alla pagina principale con un percorso relativo (compatibile con l'ingress).
                 self.send_response(303)
                 self.send_header("Location", "./")
@@ -166,9 +216,44 @@ class Panel:
 
     # ---- azioni ----
 
-    def handle(self, action, form):
+    def handle(self, action, form, lists=None):
         agent, state = self.agent, self.agent.state
+        lists = lists or {}
         try:
+            if action == "escludi":
+                pattern = form.get("entity", "").strip().lower()
+                if not ENTITY_PATTERN.fullmatch(pattern):
+                    return ("Nome non valido: usa il formato dominio.nome, ad esempio sensor.telefono_batteria "
+                            "(con * per indicarne più di una).", True)
+                excluded = list(state.get("excluded") or [])
+                if pattern in excluded:
+                    return f"{pattern} era già esclusa."
+                if len(excluded) >= MAX_EXCLUDED:
+                    return (f"Puoi escludere al massimo {MAX_EXCLUDED} entità.", True)
+                state.update(excluded=excluded + [pattern])
+                self._refresh_diagnostics()
+                return f"{pattern} non verrà più controllata dall'installatore."
+            if action == "includi":
+                pattern = form.get("entity", "")
+                state.update(excluded=[p for p in state.get("excluded") or [] if p != pattern])
+                self._refresh_diagnostics()
+                return f"{pattern} viene di nuovo controllata."
+            if action == "richieste":
+                days = form.get("days", "")
+                keep = form.get("max_closed", "")
+                state.update(ticket_retention={"days": int(days) if days in RETENTION_DAYS else None,
+                                               "max_closed": int(keep) if keep in RETENTION_KEEP else None})
+                return "Preferenze della lista salvate."
+            if action == "notifiche":
+                available = set(self._notify_services())
+                chosen = [s for s in lists.get("service", []) if s in available]
+                state.update(notify={"ha": form.get("ha") == "1", "services": chosen})
+                if form.get("prova") == "1":
+                    sent = agent.notify_client(f"{state.get('server_name') or 'Assistenza'}: prova",
+                                               "Le notifiche dell'assistenza funzionano.", "prova")
+                    return ("Notifica di prova inviata." if sent else
+                            ("Nessuna notifica inviata: scegli almeno un canale.", True))
+                return "Preferenze delle notifiche salvate."
             if action == "consenso":
                 enabled = form.get("enabled") == "1"
                 hours = DURATIONS.get(form.get("durata", "sempre"))
@@ -182,7 +267,7 @@ class Panel:
             if action == "ticket":
                 title = form.get("title", "").strip()
                 if not title:
-                    return "Scrivi almeno un titolo per la richiesta."
+                    return ("Scrivi almeno un titolo per la richiesta.", True)
                 diag = agent.fresh_diagnostics() if state.consent_active() else None
                 agent.link.open_ticket(title, form.get("description", "").strip(), form.get("contact", "").strip(), diag)
                 return "Richiesta inviata. Riceverai la risposta qui."
@@ -196,13 +281,38 @@ class Panel:
                 agent.fresh_diagnostics()
                 return "Controllo completato."
         except ServerError as e:
-            return f"Impossibile contattare l'assistenza: {e}"
+            return (f"Impossibile contattare l'assistenza: {e}", True)
         except Exception as e:  # noqa: BLE001 — il pannello non deve mai cadere
             log.exception("errore nel pannello")
-            return f"Errore: {e}"
+            return (f"Errore: {e}", True)
         return None
 
+    def _refresh_diagnostics(self):
+        try:
+            self.agent.fresh_diagnostics()
+        except Exception:  # noqa: BLE001 — se HA non risponde, il controllo partirà al prossimo giro
+            log.warning("Controllo dopo la modifica delle esclusioni non riuscito")
+        self.agent.send_diagnostics_soon()
+
+    def _notify_services(self):
+        try:
+            return ha.notify_services()
+        except ha.HAError:
+            return []
+
     # ---- pagina ----
+
+    @staticmethod
+    def _toast(flash):
+        """Conferma in basso, sempre visibile: spunta verde animata o X rossa. Solo CSS."""
+        if not flash:
+            return ""
+        text, error = flash if isinstance(flash, tuple) else (flash, False)
+        mark = ('<path class="mark" d="M18 18 L34 34 M34 18 L18 34"/>' if error
+                else '<path class="mark" d="M15 27 L23 35 L38 18"/>')
+        return (f'<div class="toast {"err" if error else "ok"}" role="{"alert" if error else "status"}">'
+                f'<svg viewBox="0 0 52 52" aria-hidden="true"><circle class="ring" cx="26" cy="26" r="23"/>{mark}</svg>'
+                f'<span>{esc(text)}</span></div>')
 
     def _ticket_html(self, t):
         """Una richiesta del cliente. Tutto arriva dal server: si fa l'escape di ogni campo
@@ -246,10 +356,26 @@ class Panel:
                     return self.page()  # ridisegna con lo stato aggiornato (revocato / da aggiornare)
                 tickets_html = f'<p class="muted">Richieste non disponibili: {esc(e)}</p>'
             if tickets is not None:
-                for t in tickets:
-                    tickets_html += self._ticket_html(t)
+                shown, hidden = filter_tickets(tickets, s.get("ticket_retention"))
+                for tk in shown:
+                    tickets_html += self._ticket_html(tk)
                 if not tickets:
                     tickets_html = '<p class="muted">Nessuna richiesta finora.</p>'
+                elif hidden:
+                    tickets_html += (f'<p class="muted small">{hidden} richiest{"a chiusa nascosta" if hidden == 1 else "e chiuse nascoste"} '
+                                     'secondo le tue preferenze. L&#39;installatore ne conserva comunque lo storico.</p>')
+                ret = s.get("ticket_retention") or {}
+                def opt(options, current, first):
+                    return f'<option value="">{first}</option>' + "".join(
+                        f'<option value="{k}"{" selected" if str(current) == k else ""}>{v}</option>' for k, v in options.items())
+                tickets_html += (
+                    f'<details><summary class="small">Quali richieste chiuse mostrare</summary>'
+                    f'<form method="post" action="richieste" class="row" style="margin-top:8px">{self._hidden()}'
+                    f'<label style="margin:0">Chiuse negli ultimi</label><select name="days" style="width:auto">'
+                    f'{opt(RETENTION_DAYS, ret.get("days"), "sempre")}</select>'
+                    f'<label style="margin:0">al massimo</label><select name="max_closed" style="width:auto">'
+                    f'{opt(RETENTION_KEEP, ret.get("max_closed"), "tutte")}</select>'
+                    f'<button class="btn ghost small">Salva</button></form></details>')
 
         diag = s.get("last_diag") or {}
         diag_html = '<p class="muted">Nessun controllo eseguito.</p>'
@@ -278,6 +404,45 @@ class Panel:
                 f'<label for="durata" style="margin:0">Attiva per</label><select id="durata" name="durata" style="width:auto">{options}</select>'
                 '<button class="btn">Attiva</button></form>')
 
+        entities_html = ""
+        if paired:
+            excluded = s.get("excluded") or []
+            flagged = [f for f in (s.get("flagged") or []) if isinstance(f, dict)]
+            rows = "".join(
+                f'<li><span class="grow">{esc(f.get("name"))} <span class="muted small">· {esc(f.get("reason"))}</span>'
+                f'<br><code>{esc(f.get("entity_id"))}</code></span>'
+                f'<form method="post" action="escludi">{self._hidden()}<input type="hidden" name="entity" value="{esc(f.get("entity_id"))}">'
+                f'<button class="btn ghost small">Non controllare</button></form></li>' for f in flagged[:50])
+            ex_rows = "".join(
+                f'<li><span class="grow"><code>{esc(p)}</code></span>'
+                f'<form method="post" action="includi">{self._hidden()}<input type="hidden" name="entity" value="{esc(p)}">'
+                f'<button class="btn ghost small">Controlla di nuovo</button></form></li>' for p in excluded)
+            entities_html = f"""<div class="card"><h2>Cosa controlla l'installatore</h2>
+<p class="muted small" style="margin-top:0">Alcune entità segnalano sempre un problema anche se va tutto bene (la batteria del telefono,
+un robot spesso spento...). Puoi escluderle: l'installatore non le vedrà più e vedrà solo quante ne hai escluse.</p>
+{f'<p style="margin:12px 0 0"><b>Segnalate dall&#39;ultimo controllo</b></p><ul class="list">{rows}</ul>' if rows else '<p class="muted small">Nessuna entità segnalata dall&#39;ultimo controllo.</p>'}
+{f'<p style="margin:16px 0 0"><b>Escluse</b></p><ul class="list">{ex_rows}</ul>' if ex_rows else ''}
+<details><summary class="small">Escludi un&#39;entità a mano</summary>
+<form method="post" action="escludi" class="row" style="margin-top:8px">{self._hidden()}
+<input name="entity" placeholder="es. sensor.telefono_batteria oppure vacuum.robot_*" style="flex:1" required>
+<button class="btn ghost small">Escludi</button></form></details></div>"""
+
+        notify_html = ""
+        if paired:
+            ns = s.get("notify") or {}
+            services = self._notify_services()
+            chosen = set(ns.get("services") or [])
+            svc_html = "".join(
+                f'<label class="check"><input type="checkbox" name="service" value="{esc(x)}"{" checked" if x in chosen else ""}> '
+                f'{esc(x.replace("mobile_app_", "App sul telefono: ").replace("_", " "))}</label>' for x in services)
+            notify_html = f"""<div class="card"><h2>Notifiche</h2>
+<p class="muted small" style="margin-top:0">Quando l&#39;installatore risponde o aggiorna una tua richiesta.</p>
+<form method="post" action="notifiche">{self._hidden()}
+<label class="check"><input type="checkbox" name="ha" value="1"{" checked" if ns.get("ha", True) else ""}> Nella campanella di Home Assistant</label>
+{svc_html or '<p class="muted small">Per riceverle anche sul telefono installa l&#39;app di Home Assistant: comparirà qui.</p>'}
+<div class="row" style="margin-top:10px"><button class="btn ghost small">Salva</button>
+<button class="btn ghost small" name="prova" value="1">Salva e invia una prova</button></div></form></div>"""
+
         error_html = ""
         if s.get("connection") in ("errore", "non_configurato", "aggiornare", "revocato"):
             hint = s.get("last_error") or "Inserisci indirizzo del server e codice di abbinamento nella configurazione dell'add-on."
@@ -297,11 +462,13 @@ class Panel:
 <title>{esc(name)}</title><style>{CSS}</style>{brand_css}</head><body><main>
 <div class="head"><div><p class="muted small" style="margin:0">Assistenza impianto</p><h1>{esc(name)}</h1></div>
 <span class="badge {conn_cls}">{conn_label}</span></div>
-{f'<div class="flash">{esc(flash)}</div>' if flash else ""}
+{self._toast(flash)}
 {error_html}
 {ticket_form}
 {f'<div class="card"><h2>Le tue richieste</h2>{tickets_html}</div>' if paired else ""}
 <div class="card"><div class="head"><h2>Stato dell'impianto</h2>
 <form method="post" action="diagnostica">{self._hidden()}<button class="btn ghost">Controlla ora</button></form></div>{diag_html}</div>
 {f'<div class="card"><h2>Accesso remoto</h2>{consent_html}</div>' if paired else ""}
+{entities_html}
+{notify_html}
 </main></body></html>"""

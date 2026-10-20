@@ -3,6 +3,7 @@
 Per aggiungere un controllo: calcola il dato in collect(), poi aggiungi un issue() con
 severità "critico", "attenzione" o "info". Lo stato generale è il problema più grave.
 """
+import fnmatch
 from datetime import datetime, timezone
 
 from . import ha
@@ -38,9 +39,19 @@ def _parse(ts):
         return None
 
 
-def collect():
+def is_excluded(entity_id, patterns):
+    """Entità esclusa dal cliente: nome esatto oppure modello con * (es. sensor.robot_*)."""
+    return any(fnmatch.fnmatchcase(entity_id, p) for p in patterns)
+
+
+def collect(excluded=()):
+    """Diagnostica da mandare al server. Le entità escluse dal cliente non vengono controllate né
+    nominate. La chiave interna "_flagged" (entità segnalate, per il pannello del cliente) va
+    tolta prima dell'invio: la toglie Agent.fresh_diagnostics."""
     now = datetime.now(timezone.utc)
     issues = []
+    flagged = []
+    excluded_count = 0
 
     def issue(severity, code, message, items=None):
         entry = {"severity": severity, "code": code, "message": message}
@@ -53,20 +64,29 @@ def collect():
     unavailable, orphans, low_battery, updates, automations_off = [], [], [], [], []
     for s in all_states:
         eid = s["entity_id"]
+        if excluded and is_excluded(eid, excluded):
+            excluded_count += 1
+            continue
         domain = eid.split(".", 1)[0]
         attrs = s.get("attributes", {})
         state = s.get("state")
 
+        def flag(reason):
+            flagged.append({"entity_id": eid, "name": _name(s), "reason": reason})
+
         if state == "unavailable" and domain not in IGNORE_UNAVAILABLE:
             # "restored" = entità rimasta nel registro ma la cui integrazione non la fornisce più
             (orphans if attrs.get("restored") else unavailable).append(eid)
+            flag("orfana" if attrs.get("restored") else "non disponibile")
 
         if attrs.get("device_class") == "battery":
             level = _num(state)
             if domain == "sensor" and level is not None and level < LOW_BATTERY:
                 low_battery.append(f"{_name(s)} ({level:.0f}%)")
+                flag(f"batteria {level:.0f}%")
             elif domain == "binary_sensor" and state == "on":
                 low_battery.append(f"{_name(s)} (scarica)")
+                flag("batteria scarica")
 
         if domain == "update" and state == "on":
             installed, latest = attrs.get("installed_version"), attrs.get("latest_version")
@@ -74,6 +94,7 @@ def collect():
 
         if domain == "automation" and state == "off":
             automations_off.append(_name(s))
+            flag("automazione disattivata")
 
     if unavailable:
         sev = "critico" if len(unavailable) > 10 else "attenzione"
@@ -137,7 +158,9 @@ def collect():
             "low_battery": len(low_battery),
             "updates": len(updates),
             "automations_off": len(automations_off),
+            "excluded": excluded_count,
         },
         "system": system,
         "issues": issues,
+        "_flagged": flagged[:200],
     }

@@ -8,6 +8,7 @@ Tre attività in parallelo:
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -45,6 +46,9 @@ class Agent:
         self._diag_lock = threading.Lock()
         self._last_diag_time = 0.0
         self._ha_version = None
+        self._urls, self._urls_at = None, 0.0
+        self._send_diag_now = False
+        self._last_ticket_check = 0.0
 
     # ---- utilità ----
 
@@ -55,12 +59,11 @@ class Agent:
     def ha_urls(self):
         """Indirizzi di Home Assistant impostati dal cliente (Impostazioni → Sistema → Rete).
         Il server li mostra all'installatore come pulsante "Apri Home Assistant"."""
-        try:
-            cfg = ha.config()
-        except ha.HAError:
-            return None
-        self._ha_version = cfg.get("version") or self._ha_version
-        return {"internal": cfg.get("internal_url"), "external": cfg.get("external_url")}
+        # Gli indirizzi cambiano di rado: li ricalcoliamo ogni 10 minuti.
+        now = time.monotonic()
+        if self._urls is None or now - self._urls_at > 600:
+            self._urls, self._urls_at = ha.network_urls(), now
+        return self._urls
 
     def ha_version(self):
         if not self._ha_version:
@@ -72,10 +75,95 @@ class Agent:
 
     def fresh_diagnostics(self):
         with self._diag_lock:
-            diag = diagnostics.collect()
+            diag = diagnostics.collect(self.state.get("excluded") or [])
+            flagged = diag.pop("_flagged", [])   # solo per il pannello del cliente, non va al server
             self._last_diag_time = time.monotonic()
-            self.state.update(last_diag=diag)
+            self.state.update(last_diag=diag, flagged=flagged)
             return diag
+
+    def send_diagnostics_soon(self):
+        """Dopo una modifica del cliente (es. entità escluse): rifà il controllo e lo invia subito."""
+        self._send_diag_now = True
+        self.wake()
+
+    # ---- notifiche al cliente sulle risposte dell'installatore ----
+
+    @staticmethod
+    def _plain(text, limit=300):
+        """Testo che arriva dal server, ripulito per le notifiche di Home Assistant (che interpretano
+        il Markdown): niente link, immagini o formattazione decise dal server."""
+        text = re.sub(r"<[^>]*>", "", str(text or ""))
+        text = re.sub(r"([\\`*_{}\[\]()#+!|>~])", r"\\\1", text)
+        text = " ".join(text.split())
+        return text[:limit] + ("…" if len(text) > limit else "")
+
+    def notify_client(self, title, message, tag):
+        settings = self.state.get("notify") or {}
+        sent = 0
+        if settings.get("ha", True):
+            try:
+                ha.call_service("persistent_notification", "create",
+                                {"title": title, "message": message, "notification_id": f"assistenza_{tag}"})
+                sent += 1
+            except ha.HAError as e:
+                log.warning("Notifica in Home Assistant non riuscita: %s", e)
+        services = [s for s in settings.get("services") or [] if re.fullmatch(r"[a-z0-9_]+", s)]
+        if services:
+            path = ha.panel_path()
+            for svc in services:
+                data = {"title": title, "message": message}
+                if path:
+                    data["data"] = {"url": path, "clickAction": path, "tag": f"assistenza_{tag}"}
+                try:
+                    ha.call_service("notify", svc, data)
+                    sent += 1
+                except ha.HAError as e:
+                    log.warning("Notifica con notify.%s non riuscita: %s", svc, e)
+        return sent
+
+    def check_ticket_updates(self, tickets_updated=None, server_tells=False):
+        """Rilegge i ticket se il server dice che sono cambiati (o ogni 5 minuti con server vecchi)
+        e avvisa il cliente delle risposte e dei cambi di stato fatti dall'installatore."""
+        now = time.monotonic()
+        if server_tells:
+            if tickets_updated == self.state.get("tickets_updated") and self.state.get("tickets_seen") is not None:
+                return
+        elif now - self._last_ticket_check < 300:
+            return
+        self._last_ticket_check = now
+        try:
+            tickets = self.link.tickets()
+        except ServerError as e:
+            log.warning("Ticket non letti: %s", e)
+            return
+        seen = self.state.get("tickets_seen")
+        new_seen = {}
+        name = self.state.get("server_name") or "Assistenza"
+        labels = {"aperto": "riaperta", "in_lavorazione": "presa in carico", "chiuso": "chiusa"}
+        for t in tickets:
+            if not isinstance(t, dict) or not isinstance(t.get("id"), int):
+                continue
+            msgs = [m for m in (t.get("messages") if isinstance(t.get("messages"), list) else []) if isinstance(m, dict)]
+            inst = [m for m in msgs if m.get("author_type") == "installatore"]
+            status = t.get("status") if t.get("status") in labels else None
+            key = str(t["id"])
+            new_seen[key] = {"status": status, "inst": len(inst)}
+            if seen is None:
+                continue  # primo controllo dopo l'avvio: registriamo lo stato senza avvisare
+            # Richiesta mai vista (appena aperta dal cliente): avvisiamo solo se l'installatore
+            # ha già risposto prima che l'agente la rileggesse.
+            prev = seen.get(key) or {"status": status, "inst": 0}
+            title = self._plain(t.get("title"), 80)
+            if len(inst) > prev.get("inst", 0):
+                self.notify_client(f"{self._plain(name, 60)}: nuova risposta",
+                                   f"«{title}»: {self._plain(inst[-1].get('text'))}", f"ticket_{key}")
+            elif status and status != prev.get("status"):
+                self.notify_client(f"{self._plain(name, 60)}: richiesta {labels[status]}",
+                                   f"La tua richiesta «{title}» è stata {labels[status]}.", f"ticket_{key}")
+        if seen is not None:
+            new_seen = {**{k: v for k, v in seen.items() if k not in new_seen}, **new_seen}
+        # teniamo solo i ticket recenti per non far crescere lo stato all'infinito
+        self.state.update(tickets_seen=dict(list(new_seen.items())[-200:]), tickets_updated=tickets_updated)
 
     def paired(self):
         return bool(self.state.get("token")) and self.state.get("connection") not in ("revocato", "aggiornare")
@@ -132,15 +220,17 @@ class Agent:
                 continue
             diag = None
             due = time.monotonic() - self._last_diag_time >= self.options["diagnostics_minutes"] * 60
-            if self.state.consent_active() and due:
+            if self.state.consent_active() and (due or self._send_diag_now):
                 try:
                     diag = self.fresh_diagnostics()
                 except ha.HAError as e:
                     log.warning("Diagnostica non riuscita: %s", e)
+            self._send_diag_now = False
             try:
                 urls = self.ha_urls()
-                self.link.report(self.ha_version(), diag, urls)
+                res = self.link.report(self.ha_version(), diag, urls) or {}
                 self.state.update(connection="collegato", last_error=None, last_contact=time.time())
+                self.check_ticket_updates(res.get("tickets_updated"), server_tells="tickets_updated" in res)
                 failures = 0
                 wait = self.options["heartbeat_seconds"]
             except ServerError as e:

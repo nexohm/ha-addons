@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.7
+- Il cliente può escludere entità dai controlli dell'installatore (anche con *, es. vacuum.robot_*):
+  non vengono più controllate né nominate, l'installatore vede solo quante sono.
+- Il cliente sceglie quali richieste chiuse vedere (ultimi 7/30/90 giorni, al massimo N): le altre
+  spariscono dal pannello, l'installatore conserva lo storico.
+- Notifiche al cliente quando l'installatore risponde o cambia stato a una richiesta: nella campanella
+  di Home Assistant e/o sul telefono (app di HA o altri servizi notify).
+- Conferme animate e sempre visibili nel pannello (spunta verde, X rossa per gli errori).
+
+## 0.1.6
+- Indirizzi di Home Assistant letti come nella schermata Impostazioni → Sistema → Rete (API websocket):
+  funziona anche con rete locale "Automatico" e con Home Assistant Cloud (Nabu Casa), prima risultavano vuoti.
+
 ## 0.1.5
 - Comunica al server gli indirizzi (interno ed esterno) di Home Assistant impostati in
   Impostazioni → Sistema → Rete: l'installatore li trova come pulsante "Apri Home Assistant".
