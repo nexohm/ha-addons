@@ -9,11 +9,13 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import threading
 import time
 
 from . import diagnostics, ha
+from .admin import AdminAccess
 from .link import AGENT_VERSION, DATA_DIR, Link, ServerError, State
 from .panel import Panel
 
@@ -49,6 +51,7 @@ class Agent:
         self._urls, self._urls_at = None, 0.0
         self._send_diag_now = False
         self._last_ticket_check = 0.0
+        self.admin = AdminAccess(self)
 
     # ---- utilità ----
 
@@ -232,8 +235,9 @@ class Agent:
             self._send_diag_now = False
             try:
                 urls = self.ha_urls()
-                res = self.link.report(self.ha_version(), diag, urls) or {}
+                res = self.link.report(self.ha_version(), diag, urls, self.admin.status()) or {}
                 self.state.update(connection="collegato", last_error=None, last_contact=time.time())
+                self.admin.on_server_request(res.get("admin_requested"))
                 self.check_ticket_updates(res.get("tickets_updated"), server_tells="tickets_updated" in res)
                 failures = 0
                 wait = self.options["heartbeat_seconds"]
@@ -247,7 +251,7 @@ class Agent:
 
     # ---- ciclo dei comandi ----
 
-    COMMANDS = {"ping", "run_diagnostics"}
+    COMMANDS = {"ping", "run_diagnostics", "admin_password", "admin_close"}
 
     def execute(self, cmd):
         name = cmd.get("name")
@@ -255,6 +259,17 @@ class Agent:
             return False, None, f"comando «{name}» non permesso da questo agente"
         if name == "ping":
             return True, {"agent_version": AGENT_VERSION, "ha_version": self.ha_version(), "time": time.time()}, None
+        # L'accesso amministratore ha un permesso suo, dato dal cliente nel pannello
+        if name == "admin_password":
+            if not self.admin.active():
+                return False, None, "il cliente non ha concesso l'accesso amministratore"
+            try:
+                return True, self.admin.reveal(), None
+            except ha.HAError as e:
+                return False, None, f"Home Assistant non ha creato l'utente: {e}"
+        if name == "admin_close":
+            self.admin.close("installatore")
+            return True, {"closed": True}, None
         if not self.state.consent_active():
             return False, None, "accesso remoto sospeso dal cliente"
         if name == "run_diagnostics":
@@ -286,8 +301,21 @@ class Agent:
 
     # ---- avvio ----
 
+    def _on_stop(self, signum, frame):
+        """Add-on arrestato, aggiornato o disinstallato: l'utente amministratore non deve restare in HA
+        senza nessuno che lo cancelli alla scadenza. Il permesso del cliente resta: alla prossima
+        richiesta di password l'utente viene ricreato."""
+        log.info("Arresto: cancello l'eventuale utente amministratore")
+        try:
+            self.admin.drop_user()
+        except Exception:  # noqa: BLE001
+            log.exception("Utente amministratore non cancellato all'arresto")
+        sys.exit(0)
+
     def run(self):
         log.info("Agente Assistenza %s in avvio", AGENT_VERSION)
+        signal.signal(signal.SIGTERM, self._on_stop)
+        signal.signal(signal.SIGINT, self._on_stop)
         if ha.TOKEN:
             log.info("Chiave del Supervisor trovata (%s)", ha.TOKEN_SOURCE)
         else:
@@ -295,6 +323,7 @@ class Agent:
         Panel(self, int(os.environ.get("PANEL_PORT", "8099"))).start()
         threading.Thread(target=self.report_loop, daemon=True, name="report").start()
         threading.Thread(target=self.command_loop, daemon=True, name="commands").start()
+        threading.Thread(target=self.admin.loop, daemon=True, name="admin").start()
         while True:
             self.ensure_paired()
             time.sleep(60 if self.paired() else 30)

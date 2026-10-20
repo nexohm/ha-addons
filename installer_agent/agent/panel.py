@@ -15,6 +15,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import ha
+from .admin import DURATION_LABELS as ADMIN_DURATIONS
 from .link import ServerError
 
 log = logging.getLogger("agent.panel")
@@ -77,6 +78,7 @@ box-shadow:0 12px 32px rgba(0,0,0,.2);font-weight:600;animation:tin .35s cubic-b
 .tabs .n{display:inline-block;min-width:20px;padding:0 6px;margin-left:6px;border-radius:999px;font-size:.75rem;background:var(--brand);color:#fff;text-align:center}
 .card:target,details:target{scroll-margin-top:12px}
 details.card{border-top:1px solid var(--line);padding:18px}details.card summary{font-size:1.02rem}
+.warnbox{background:var(--warnb);color:var(--ink);border-left:4px solid var(--warn);border-radius:8px;padding:10px 12px;margin:0 0 10px}
 .btn.small{padding:4px 10px;font-size:.85rem}.check{display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0}.check input{width:auto}
 """
 
@@ -106,7 +108,7 @@ SECTIONS = [("richieste", "Richieste"), ("impianto", "Impianto"), ("preferenze",
 RETURN_TO = {
     "ticket": "richieste#richieste", "richieste": "preferenze#lista", "notifiche": "preferenze#notifiche",
     "consenso": "impianto#accesso", "diagnostica": "impianto#stato", "escludi": "impianto#entita",
-    "includi": "impianto#escluse", "etichette": "impianto#etichette",
+    "includi": "impianto#escluse", "etichette": "impianto#etichette", "admin": "impianto#admin",
 }
 MAX_LABELS = 50
 
@@ -257,6 +259,21 @@ class Panel:
                 state.update(excluded=excluded + [pattern])
                 self._refresh_diagnostics()
                 return f"{pattern} non verrà più controllata dall'installatore."
+            if action == "admin":
+                op = form.get("op")
+                if op == "consenti":
+                    hours = agent.admin.grant(form.get("durata", ""))
+                    if hours is None:
+                        return ("Accesso amministratore concesso senza scadenza. Ti ricorderemo ogni 30 giorni che è "
+                                "attivo, e l'utente viene cancellato se l'installatore non lo usa per 30 giorni.")
+                    return f"Accesso amministratore concesso fino al {fmt_epoch(agent.admin.get()['until'])}."
+                if op == "rifiuta":
+                    agent.admin.decline()
+                    return "Richiesta di accesso amministratore rifiutata."
+                if op == "chiudi":
+                    agent.admin.close("cliente")
+                    return "Accesso amministratore chiuso: l'utente dell'installatore è stato cancellato."
+                return ("Operazione non valida.", True)
             if action == "etichette":
                 known = self._labels()
                 chosen = [l for l in lists.get("label", []) if l in known][:MAX_LABELS]
@@ -406,6 +423,8 @@ class Panel:
                     return self.page(section)  # ridisegna con lo stato aggiornato (revocato / da aggiornare)
                 tickets_error = f'<p class="muted">Richieste non disponibili: {esc(e)}</p>'
         open_count = sum(1 for t in tickets or [] if isinstance(t, dict) and t.get("status") != "chiuso")
+        adm = self.agent.admin.get()
+        admin_request = bool(adm["request"]) and adm["request"] != adm["declined"] and not self.agent.admin.active()
 
         error_html = ""
         if s.get("connection") in ("errore", "non_configurato", "aggiornare", "revocato"):
@@ -421,7 +440,8 @@ class Panel:
                     "preferenze": lambda: self._section_preferenze(s)}[section]()
             tabs = '<nav class="tabs">' + "".join(
                 f'<a href="./?s={k}"{" class=on" if k == section else ""}>{l}'
-                + (f'<span class="n">{open_count}</span>' if k == "richieste" and open_count else "") + "</a>"
+                + (f'<span class="n">{open_count}</span>' if k == "richieste" and open_count else "")
+                + ('<span class="n">!</span>' if k == "impianto" and admin_request else "") + "</a>"
                 for k, l in SECTIONS) + "</nav>"
 
         return f"""<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -493,6 +513,7 @@ class Panel:
                 f'<label for="durata" style="margin:0">Attiva per</label><select id="durata" name="durata" style="width:auto">{options}</select>'
                 '<button class="btn">Attiva</button></form>')
         out += f'<div class="card" id="accesso"><h2>Accesso remoto</h2>{consent_html}</div>'
+        out += self._admin_html()
 
         excluded = s.get("excluded") or []
         flagged = [f for f in (s.get("flagged") or []) if isinstance(f, dict)]
@@ -536,6 +557,37 @@ un robot spesso spento...). Puoi escluderle: l'installatore non le vedrà più e
 <button class="btn ghost small">Escludi</button></form></details>
 {labels_html}</div>"""
         return out
+
+    def _admin_html(self):
+        admin = self.agent.admin
+        a = admin.get()
+        name = esc(self.agent.state.get("server_name") or "l'installatore")
+        if admin.active():
+            when = f"fino al <b>{fmt_epoch(a['until'])}</b>" if a["until"] else "<b>senza scadenza</b>"
+            used = (f"Ultimo accesso dell&#39;installatore: {fmt_epoch(a['last_reveal'])}"
+                    + (" (utente attivo ora)." if a["user_id"] else " (utente già cancellato).")) if a["last_reveal"] else \
+                "L&#39;installatore non è ancora entrato."
+            body = (f'<p style="margin:0 0 6px">Hai concesso a {name} l&#39;accesso amministratore {when}.</p>'
+                    f'<p class="muted small" style="margin:0 0 10px">{used} Ogni volta che entra ricevi una notifica.</p>'
+                    + ('<p class="warnbox small">Senza scadenza: ogni 30 giorni ti ricorderemo che l&#39;accesso è attivo, '
+                       'e se l&#39;installatore non lo usa per 30 giorni il suo utente viene cancellato.</p>' if not a["until"] else "")
+                    + f'<form method="post" action="admin">{self._hidden()}<input type="hidden" name="op" value="chiudi">'
+                    '<button class="btn">Chiudi l&#39;accesso adesso</button></form>')
+        else:
+            request = a["request"] and a["request"] != a["declined"]
+            options = "".join(f'<option value="{k}"{" selected" if k == "4h" else ""}>{l}</option>' for k, l in ADMIN_DURATIONS)
+            body = ((f'<p class="warnbox"><b>{name} chiede l&#39;accesso amministratore</b> al tuo Home Assistant.</p>' if request else "")
+                    + '<p class="muted small" style="margin:0 0 10px">Con l&#39;accesso amministratore l&#39;installatore può entrare nel tuo '
+                    'Home Assistant e modificare tutto (integrazioni, automazioni, dispositivi). Viene creato un utente apposta, '
+                    'con una password nuova ogni volta che entra; alla scadenza viene cancellato.</p>'
+                    f'<form method="post" action="admin" class="row">{self._hidden()}<input type="hidden" name="op" value="consenti">'
+                    f'<label for="adurata" style="margin:0">Consenti per</label><select id="adurata" name="durata" style="width:auto">{options}</select>'
+                    '<button class="btn">Consenti</button></form>'
+                    '<p class="muted small" style="margin:8px 0 0"><b>Senza scadenza</b> è comodo ma più rischioso: l&#39;accesso resta '
+                    'finché non lo chiudi. Ti ricorderemo ogni 30 giorni che è attivo, e l&#39;utente viene cancellato se non viene usato per 30 giorni.</p>'
+                    + (f'<form method="post" action="admin" style="margin-top:10px">{self._hidden()}<input type="hidden" name="op" value="rifiuta">'
+                       '<button class="btn ghost small">Rifiuta la richiesta</button></form>' if request else ""))
+        return f'<div class="card" id="admin"><h2>Accesso amministratore</h2>{body}</div>'
 
     def _section_preferenze(self, s):
         ns = s.get("notify") or {}

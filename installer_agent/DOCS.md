@@ -21,8 +21,23 @@ L'indirizzo del server deve iniziare con `https://`: il collegamento è cifrato.
 **Non vede** telecamere, posizione delle persone, cronologia né i tuoi dati personali, e
 **non può** modificare la configurazione: l'agente esegue solo i comandi di controllo previsti.
 
+## Accesso amministratore (solo se lo concedi tu)
+
+Se l'installatore deve correggere qualcosa nel tuo Home Assistant, può chiederti l'**accesso
+amministratore**. Lo concedi (o rifiuti) dal pannello **Assistenza**, scheda **Impianto**, scegliendo
+per quanto tempo: 1 ora, 4 ore, 24 ore, 7 giorni o senza scadenza.
+
+- L'agente crea un utente apposta (`assistenza_…`) solo quando l'installatore entra, ogni volta con una
+  password nuova: le password e le sessioni precedenti smettono di funzionare.
+- Ricevi una notifica ogni volta che l'installatore entra, e puoi chiudere l'accesso quando vuoi.
+- Alla scadenza l'utente viene cancellato dall'agente, anche se il server dell'installatore non è raggiungibile.
+- **Senza scadenza**: ogni 30 giorni ricevi un promemoria; se l'installatore non entra per 30 giorni,
+  il suo utente viene cancellato (l'accesso resta concesso finché non lo chiudi).
+- Se arresti o disinstalli l'add-on, l'utente dell'installatore viene cancellato.
+
 ## Sospendere l'accesso
 
-Dal pannello **Assistenza** puoi sospendere l'accesso remoto in qualsiasi momento. Mentre è
+Dal pannello **Assistenza** puoi sospendere l'accesso remoto in qualsiasi momento (l'accesso
+amministratore si chiude a parte, dalla stessa scheda). Mentre è
 sospeso l'installatore vede solo se l'impianto è acceso, e nessuna verifica viene eseguita.
 Per scollegare del tutto l'impianto basta arrestare o disinstallare l'add-on.

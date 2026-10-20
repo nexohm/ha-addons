@@ -9,6 +9,10 @@
   le altre non vengono controllate né nominate all'installatore. Se le etichette non si possono leggere,
   il controllo salta il giro invece di mandare entità escluse.
 - Il modulo per una nuova richiesta resta chiuso quando ce n'è già una in corso.
+- Accesso amministratore temporaneo per l'installatore, solo se il cliente lo concede (1 ora, 4 ore,
+  24 ore, 7 giorni o senza scadenza). L'utente in HA viene creato a ogni ingresso con una password nuova
+  (mai salvata), cancellato alla scadenza anche senza server, all'arresto dell'add-on e, senza scadenza,
+  dopo 30 giorni di inutilizzo; promemoria mensile e notifica al cliente a ogni ingresso.
 
 ## 0.1.7
 - Il cliente può escludere entità dai controlli dell'installatore (anche con *, es. vacuum.robot_*):
