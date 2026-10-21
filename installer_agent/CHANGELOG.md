@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.8 (in sviluppo)
+## 0.1.8
 - Pannello diviso in tre schede: Richieste, Impianto, Preferenze. La pagina è molto più corta e il
   numero sulla scheda Richieste indica le richieste ancora aperte.
 - Dopo ogni salvataggio il pannello torna alla sezione appena usata invece che all'inizio della pagina
