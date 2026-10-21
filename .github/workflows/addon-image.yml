@@ -3,12 +3,17 @@
 # La versione viene letta da installer_agent/config.yaml: per pubblicarne una nuova basta alzarla.
 # Branch sviluppo: versioni di prova tipo "0.1.8-dev1", pubblicate senza toccare "latest".
 # Per provarle: in HA aggiungere il repository https://github.com/nexohm/ha-addons#sviluppo
+# Pull request verso main: compila sempre (anche senza modifiche all'add-on, così i controlli
+# richiesti dalla protezione di main ci sono sempre) e non pubblica nulla; fallisce se la
+# versione è ancora di prova, quindi il merge resta bloccato finché non è definitiva.
 name: Immagini add-on
 
 on:
   push:
     branches: [main, sviluppo]
     paths: ["installer_agent/**"]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -31,8 +36,12 @@ jobs:
           version=$(python3 -c "import yaml;print(yaml.safe_load(open('installer_agent/config.yaml'))['version'])")
           owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           # Le versioni di prova non devono mai arrivare ai clienti, e su sviluppo servono solo quelle
+          publish=true
+          [[ "$GITHUB_EVENT_NAME" == pull_request ]] && publish=false
           if [[ "$GITHUB_REF" == refs/heads/sviluppo && "$version" != *-dev* ]]; then
-            echo "::error::Sul branch sviluppo la versione deve finire con -devN (es. 0.1.8-dev1), ora è $version"; exit 1
+            # versione definitiva preparata per il merge: si compila per controllo, ma la pubblica solo main
+            echo "::notice::Versione definitiva $version su sviluppo: compilo senza pubblicare (la pubblica il merge su main)"
+            publish=false
           fi
           if [[ "$GITHUB_REF" != refs/heads/sviluppo && "$version" == *-dev* ]]; then
             echo "::error::La versione $version è di prova: prima del merge va impostata la versione definitiva"; exit 1
@@ -48,11 +57,13 @@ jobs:
             echo "::error::Versione definitiva con il nome di prova ($name): rimettere il nome normale"; exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
           [[ "$version" == *-dev* ]] && echo "latest=false" >> "$GITHUB_OUTPUT" || echo "latest=true" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/$owner/${{ matrix.arch }}-addon-installer_agent" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
+        if: steps.info.outputs.publish == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -61,7 +72,7 @@ jobs:
         with:
           context: installer_agent
           platforms: ${{ matrix.platform }}
-          push: true
+          push: ${{ steps.info.outputs.publish == 'true' }}
           build-args: |
             BUILD_FROM=ghcr.io/home-assistant/${{ matrix.arch }}-base:latest
           tags: |
