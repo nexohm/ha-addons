@@ -15,7 +15,7 @@ import threading
 import time
 
 from . import diagnostics, ha
-from .admin import AdminAccess
+from .admin import AdminAccess, person
 from .link import AGENT_VERSION, DATA_DIR, Link, ServerError, State
 from .panel import Panel
 
@@ -162,11 +162,15 @@ class Agent:
             prev = seen.get(key) or {"status": status, "inst": 0}
             title = self._plain(t.get("title"), 80)
             if len(inst) > prev.get("inst", 0):
+                author = person(inst[-1].get("author_name"))
+                who = f"{self._plain(author, 60)} ha risposto" if author else "Nuova risposta"
                 self.notify_client(f"{self._plain(name, 60)}: nuova risposta",
-                                   f"«{title}»: {self._plain(inst[-1].get('text'))}", f"ticket_{key}")
+                                   f"{who} a «{title}»: {self._plain(inst[-1].get('text'))}", f"ticket_{key}")
             elif status and status != prev.get("status"):
+                tech = person(t.get("assigned_name")) if status == "in_lavorazione" else None
+                by = f" da {self._plain(tech, 60)}" if tech else ""
                 self.notify_client(f"{self._plain(name, 60)}: richiesta {labels[status]}",
-                                   f"La tua richiesta «{title}» è stata {labels[status]}.", f"ticket_{key}")
+                                   f"La tua richiesta «{title}» è stata {labels[status]}{by}.", f"ticket_{key}")
         if seen is not None:
             new_seen = {**{k: v for k, v in seen.items() if k not in new_seen}, **new_seen}
         # teniamo solo i ticket recenti per non far crescere lo stato all'infinito
@@ -237,7 +241,7 @@ class Agent:
                 urls = self.ha_urls()
                 res = self.link.report(self.ha_version(), diag, urls, self.admin.status()) or {}
                 self.state.update(connection="collegato", last_error=None, last_contact=time.time())
-                self.admin.on_server_request(res.get("admin_requested"))
+                self.admin.on_server_request(res.get("admin_requested"), res.get("admin_requested_by"))
                 self.check_ticket_updates(res.get("tickets_updated"), server_tells="tickets_updated" in res)
                 failures = 0
                 wait = self.options["heartbeat_seconds"]
@@ -255,6 +259,7 @@ class Agent:
 
     def execute(self, cmd):
         name = cmd.get("name")
+        args = cmd.get("args") if isinstance(cmd.get("args"), dict) else {}
         if name not in self.COMMANDS:
             return False, None, f"comando «{name}» non permesso da questo agente"
         if name == "ping":
@@ -264,11 +269,11 @@ class Agent:
             if not self.admin.active():
                 return False, None, "il cliente non ha concesso l'accesso amministratore"
             try:
-                return True, self.admin.reveal(), None
+                return True, self.admin.reveal(args.get("by")), None
             except ha.HAError as e:
                 return False, None, f"Home Assistant non ha creato l'utente: {e}"
         if name == "admin_close":
-            self.admin.close("installatore")
+            self.admin.close("installatore", args.get("by"))
             return True, {"closed": True}, None
         if not self.state.consent_active():
             return False, None, "accesso remoto sospeso dal cliente"

@@ -72,8 +72,9 @@ box-shadow:0 12px 32px rgba(0,0,0,.2);font-weight:600;animation:tin .35s cubic-b
 @media(prefers-reduced-motion:reduce){.toast,.toast.err{animation:tout .3s ease-in 6s forwards}.toast .ring,.toast .mark{animation:none;stroke-dashoffset:0}}
 .list{list-style:none;padding:0;margin:8px 0 0}.list li{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--line)}
 .list li:first-child{border-top:0}.list .grow{flex:1;min-width:0}.list code{font-size:.8rem;color:var(--muted);word-break:break-all}
-.tabs{display:flex;gap:4px;margin-top:18px;border-bottom:1px solid var(--line);overflow-x:auto}
-.tabs a{padding:9px 14px;color:var(--muted);text-decoration:none;font-weight:600;border-bottom:3px solid transparent;margin-bottom:-1px;white-space:nowrap}
+.tabs{display:flex;gap:4px;margin-top:18px;box-shadow:inset 0 -1px 0 var(--line);overflow-x:auto;overflow-y:hidden;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tabs a{padding:9px 14px;color:var(--muted);text-decoration:none;font-weight:600;border-bottom:3px solid transparent;white-space:nowrap}
 .tabs a:hover{color:var(--ink)}.tabs a.on{color:var(--ink);border-bottom-color:var(--brand)}
 .tabs .n{display:inline-block;min-width:20px;padding:0 6px;margin-left:6px;border-radius:999px;font-size:.75rem;background:var(--brand);color:#fff;text-align:center}
 .card:target,details:target{scroll-margin-top:12px}
@@ -564,7 +565,8 @@ un robot spesso spento...). Puoi escluderle: l'installatore non le vedrà più e
         name = esc(self.agent.state.get("server_name") or "l'installatore")
         if admin.active():
             when = f"fino al <b>{fmt_epoch(a['until'])}</b>" if a["until"] else "<b>senza scadenza</b>"
-            used = (f"Ultimo accesso dell&#39;installatore: {fmt_epoch(a['last_reveal'])}"
+            who = f"di {esc(a['reveal_by'])}" if a.get("reveal_by") else "dell&#39;installatore"
+            used = (f"Ultimo accesso {who}: {fmt_epoch(a['last_reveal'])}"
                     + (" (utente attivo ora)." if a["user_id"] else " (utente già cancellato).")) if a["last_reveal"] else \
                 "L&#39;installatore non è ancora entrato."
             body = (f'<p style="margin:0 0 6px">Hai concesso a {name} l&#39;accesso amministratore {when}.</p>'
@@ -576,7 +578,8 @@ un robot spesso spento...). Puoi escluderle: l'installatore non le vedrà più e
         else:
             request = a["request"] and a["request"] != a["declined"]
             options = "".join(f'<option value="{k}"{" selected" if k == "4h" else ""}>{l}</option>' for k, l in ADMIN_DURATIONS)
-            body = ((f'<p class="warnbox"><b>{name} chiede l&#39;accesso amministratore</b> al tuo Home Assistant.</p>' if request else "")
+            asker = f"{esc(a['request_by'])} di {name}" if a.get("request_by") else name
+            body = ((f'<p class="warnbox"><b>{asker} chiede l&#39;accesso amministratore</b> al tuo Home Assistant.</p>' if request else "")
                     + '<p class="muted small" style="margin:0 0 10px">Con l&#39;accesso amministratore l&#39;installatore può entrare nel tuo '
                     'Home Assistant e modificare tutto (integrazioni, automazioni, dispositivi). Viene creato un utente apposta, '
                     'con una password nuova ogni volta che entra; alla scadenza viene cancellato.</p>'

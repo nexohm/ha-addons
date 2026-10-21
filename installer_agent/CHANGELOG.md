@@ -13,6 +13,11 @@
   24 ore, 7 giorni o senza scadenza). L'utente in HA viene creato a ogni ingresso con una password nuova
   (mai salvata), cancellato alla scadenza anche senza server, all'arresto dell'add-on e, senza scadenza,
   dopo 30 giorni di inutilizzo; promemoria mensile e notifica al cliente a ogni ingresso.
+- Le notifiche al cliente dicono anche quale tecnico agisce, oltre al nome dell'azienda: chi chiede
+  l'accesso amministratore, chi entra, chi lo chiude, chi risponde a una richiesta e chi la prende in
+  carico. Anche l'utente creato in Home Assistant porta il nome del tecnico. Con un server più vecchio
+  resta solo il nome dell'azienda.
+- Tolta la barra di scorrimento che compariva accanto alle schede del pannello.
 
 ## 0.1.7
 - Il cliente può escludere entità dai controlli dell'installatore (anche con *, es. vacuum.robot_*):

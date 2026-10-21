@@ -29,7 +29,16 @@ REMINDER_DAYS = 30    # senza scadenza: promemoria al cliente ogni 30 giorni
 REQUEST_MAX_AGE = 24 * 3600  # una richiesta dell'installatore vale 24 ore
 
 DEFAULT = {"granted": False, "until": None, "granted_at": None, "user_id": None, "username": None,
-           "last_reveal": None, "last_reminder": None, "request": None, "request_notified": None, "declined": None}
+           "last_reveal": None, "last_reminder": None, "request": None, "request_notified": None, "declined": None,
+           "request_by": None, "reveal_by": None}
+
+
+def person(value):
+    """Nome del tecnico che arriva dal server: solo testo semplice, una riga, al massimo 60 caratteri."""
+    if not isinstance(value, str):
+        return None
+    value = " ".join("".join(ch for ch in value if ch.isprintable()).split())[:60]
+    return value or None
 
 
 def _iso(ts):
@@ -90,8 +99,8 @@ class AdminAccess:
         self._save(request=None, declined=a["request"])
         self.agent.wake()
 
-    def close(self, reason="cliente"):
-        """Chiude il permesso e cancella l'utente (se c'è)."""
+    def close(self, reason="cliente", by=None):
+        """Chiude il permesso e cancella l'utente (se c'è). by: tecnico che l'ha chiuso, se noto."""
         with self._lock:
             a = self.get()
             was = a["granted"] or a["user_id"]
@@ -104,7 +113,7 @@ class AdminAccess:
                 log.warning("Utente amministratore non ancora cancellato, riprovo: %s", e)
         if was and reason != "cliente":
             msgs = {"scaduto": "è scaduto ed è stato chiuso automaticamente",
-                    "installatore": f"è stato chiuso da {self._name()}",
+                    "installatore": (f"è stato chiuso da {self.agent._plain(person(by), 60)}" if person(by) else "è stato chiuso dall'installatore"),
                     "scollegato": "è stato chiuso perché l'impianto non è più collegato all'assistenza"}
             self.agent.notify_client(f"{self._plain_name()}: accesso amministratore chiuso",
                                      f"L'accesso amministratore di {self._plain_name()} {msgs.get(reason, 'è stato chiuso')}.",
@@ -115,27 +124,35 @@ class AdminAccess:
     def _plain_name(self):
         return self.agent._plain(self._name(), 60)
 
+    def _plain_who(self, by):
+        """«Mario Rossi di Rossi Impianti», oppure solo l'azienda se il tecnico non è noto."""
+        if by and by.casefold() != self._name().casefold():
+            return f"{self.agent._plain(by, 60)} di {self._plain_name()}"
+        return self._plain_name()
+
     # ---- richieste dall'installatore (dal rapporto col server) ----
 
-    def on_server_request(self, requested_at):
-        """requested_at: data della richiesta dell'installatore, oppure None."""
+    def on_server_request(self, requested_at, requested_by=None):
+        """requested_at: data della richiesta dell'installatore, oppure None.
+        requested_by: nome del tecnico che l'ha chiesta (server più vecchi non lo mandano)."""
         a = self.get()
         if not isinstance(requested_at, str) or len(requested_at) > 40:
             requested_at = None
         if requested_at == a["declined"]:
             return  # già rifiutata dal cliente
-        if requested_at != a["request"]:
-            self._save(request=requested_at)
+        by = person(requested_by) if requested_at else None
+        if requested_at != a["request"] or by != a["request_by"]:
+            self._save(request=requested_at, request_by=by)
         if requested_at and not self.active() and a["request_notified"] != requested_at:
             self._save(request_notified=requested_at)
             self.agent.notify_client(f"{self._plain_name()}: richiesta di accesso amministratore",
-                                     f"{self._plain_name()} chiede l'accesso amministratore al tuo Home Assistant. "
+                                     f"{self._plain_who(by)} chiede l'accesso amministratore al tuo Home Assistant. "
                                      "Apri il pannello Assistenza, scheda Impianto, per consentirlo o rifiutarlo.",
                                      "admin")
 
     # ---- comandi dell'installatore ----
 
-    def reveal(self):
+    def reveal(self, by=None):
         """Crea l'utente da zero (password nuova, sessioni vecchie chiuse) e restituisce le credenziali."""
         if not self.active():
             raise PermissionError("il cliente non ha concesso l'accesso amministratore")
@@ -143,7 +160,9 @@ class AdminAccess:
             self._delete_user()
             username = "assistenza_" + secrets.token_hex(3)
             password = _password()
-            result = ha.ws_command("config/auth/create", name=f"{self._name()} (assistenza)"[:60],
+            by = person(by)
+            label = f"{by} · {self._name()}" if by and by.casefold() != self._name().casefold() else self._name()
+            result = ha.ws_command("config/auth/create", name=f"{label} (assistenza)"[:60],
                                    group_ids=["system-admin"], local_only=False)
             user_id = ((result or {}).get("user") or {}).get("id")
             if not isinstance(user_id, str):
@@ -156,10 +175,10 @@ class AdminAccess:
             except ha.HAError:
                 self._delete_user()
                 raise
-            self._save(username=username, last_reveal=time.time())
+            self._save(username=username, last_reveal=time.time(), reveal_by=by)
         log.info("Utente amministratore %s creato per l'installatore", username)
         self.agent.notify_client(f"{self._plain_name()}: accesso amministratore in uso",
-                                 f"{self._plain_name()} ha appena aperto una sessione da amministratore nel tuo "
+                                 f"{self._plain_who(by)} ha appena aperto una sessione da amministratore nel tuo "
                                  "Home Assistant. Puoi chiuderla quando vuoi dal pannello Assistenza.", "admin")
         return {"username": username, "password": password}
 
