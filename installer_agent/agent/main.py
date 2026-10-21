@@ -9,11 +9,13 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import threading
 import time
 
 from . import diagnostics, ha
+from .admin import AdminAccess, person
 from .link import AGENT_VERSION, DATA_DIR, Link, ServerError, State
 from .panel import Panel
 
@@ -49,6 +51,7 @@ class Agent:
         self._urls, self._urls_at = None, 0.0
         self._send_diag_now = False
         self._last_ticket_check = 0.0
+        self.admin = AdminAccess(self)
 
     # ---- utilità ----
 
@@ -75,7 +78,11 @@ class Agent:
 
     def fresh_diagnostics(self):
         with self._diag_lock:
-            diag = diagnostics.collect(self.state.get("excluded") or [])
+            only = self.state.get("only_labels") or []
+            # Se il filtro per etichette non si può applicare, meglio nessun controllo che mostrare
+            # all'installatore entità che il cliente ha escluso: ha.HAError ferma questo giro.
+            labels_of = ha.entity_labels() if only else None
+            diag = diagnostics.collect(self.state.get("excluded") or [], only, labels_of)
             flagged = diag.pop("_flagged", [])   # solo per il pannello del cliente, non va al server
             self._last_diag_time = time.monotonic()
             self.state.update(last_diag=diag, flagged=flagged)
@@ -155,11 +162,15 @@ class Agent:
             prev = seen.get(key) or {"status": status, "inst": 0}
             title = self._plain(t.get("title"), 80)
             if len(inst) > prev.get("inst", 0):
+                author = person(inst[-1].get("author_name"))
+                who = f"{self._plain(author, 60)} ha risposto" if author else "Nuova risposta"
                 self.notify_client(f"{self._plain(name, 60)}: nuova risposta",
-                                   f"«{title}»: {self._plain(inst[-1].get('text'))}", f"ticket_{key}")
+                                   f"{who} a «{title}»: {self._plain(inst[-1].get('text'))}", f"ticket_{key}")
             elif status and status != prev.get("status"):
+                tech = person(t.get("assigned_name")) if status == "in_lavorazione" else None
+                by = f" da {self._plain(tech, 60)}" if tech else ""
                 self.notify_client(f"{self._plain(name, 60)}: richiesta {labels[status]}",
-                                   f"La tua richiesta «{title}» è stata {labels[status]}.", f"ticket_{key}")
+                                   f"La tua richiesta «{title}» è stata {labels[status]}{by}.", f"ticket_{key}")
         if seen is not None:
             new_seen = {**{k: v for k, v in seen.items() if k not in new_seen}, **new_seen}
         # teniamo solo i ticket recenti per non far crescere lo stato all'infinito
@@ -177,6 +188,12 @@ class Agent:
                               last_error="L'installatore ha revocato il collegamento. Serve un nuovo codice di abbinamento.")
         elif e.status == 426:
             self.state.update(connection="aggiornare", last_error=str(e))
+        elif e.status == 423:
+            # azienda dell'installatore sospesa dal gestore del server: l'abbinamento resta, si riprova
+            # più tardi e quando l'azienda viene riattivata tutto riparte da solo
+            self.state.update(connection="sospeso",
+                              last_error="L'assistenza dell'installatore è sospesa: per ora non segue questo impianto. "
+                                         "Il collegamento riprenderà da solo quando verrà riattivata.")
         else:
             self.state.update(connection="errore", last_error=str(e))
 
@@ -228,8 +245,9 @@ class Agent:
             self._send_diag_now = False
             try:
                 urls = self.ha_urls()
-                res = self.link.report(self.ha_version(), diag, urls) or {}
+                res = self.link.report(self.ha_version(), diag, urls, self.admin.status()) or {}
                 self.state.update(connection="collegato", last_error=None, last_contact=time.time())
+                self.admin.on_server_request(res.get("admin_requested"), res.get("admin_requested_by"))
                 self.check_ticket_updates(res.get("tickets_updated"), server_tells="tickets_updated" in res)
                 failures = 0
                 wait = self.options["heartbeat_seconds"]
@@ -243,14 +261,26 @@ class Agent:
 
     # ---- ciclo dei comandi ----
 
-    COMMANDS = {"ping", "run_diagnostics"}
+    COMMANDS = {"ping", "run_diagnostics", "admin_password", "admin_close"}
 
     def execute(self, cmd):
         name = cmd.get("name")
+        args = cmd.get("args") if isinstance(cmd.get("args"), dict) else {}
         if name not in self.COMMANDS:
             return False, None, f"comando «{name}» non permesso da questo agente"
         if name == "ping":
             return True, {"agent_version": AGENT_VERSION, "ha_version": self.ha_version(), "time": time.time()}, None
+        # L'accesso amministratore ha un permesso suo, dato dal cliente nel pannello
+        if name == "admin_password":
+            if not self.admin.active():
+                return False, None, "il cliente non ha concesso l'accesso amministratore"
+            try:
+                return True, self.admin.reveal(args.get("by")), None
+            except ha.HAError as e:
+                return False, None, f"Home Assistant non ha creato l'utente: {e}"
+        if name == "admin_close":
+            self.admin.close("installatore", args.get("by"))
+            return True, {"closed": True}, None
         if not self.state.consent_active():
             return False, None, "accesso remoto sospeso dal cliente"
         if name == "run_diagnostics":
@@ -282,8 +312,21 @@ class Agent:
 
     # ---- avvio ----
 
+    def _on_stop(self, signum, frame):
+        """Add-on arrestato, aggiornato o disinstallato: l'utente amministratore non deve restare in HA
+        senza nessuno che lo cancelli alla scadenza. Il permesso del cliente resta: alla prossima
+        richiesta di password l'utente viene ricreato."""
+        log.info("Arresto: cancello l'eventuale utente amministratore")
+        try:
+            self.admin.drop_user()
+        except Exception:  # noqa: BLE001
+            log.exception("Utente amministratore non cancellato all'arresto")
+        sys.exit(0)
+
     def run(self):
         log.info("Agente Assistenza %s in avvio", AGENT_VERSION)
+        signal.signal(signal.SIGTERM, self._on_stop)
+        signal.signal(signal.SIGINT, self._on_stop)
         if ha.TOKEN:
             log.info("Chiave del Supervisor trovata (%s)", ha.TOKEN_SOURCE)
         else:
@@ -291,6 +334,7 @@ class Agent:
         Panel(self, int(os.environ.get("PANEL_PORT", "8099"))).start()
         threading.Thread(target=self.report_loop, daemon=True, name="report").start()
         threading.Thread(target=self.command_loop, daemon=True, name="commands").start()
+        threading.Thread(target=self.admin.loop, daemon=True, name="admin").start()
         while True:
             self.ensure_paired()
             time.sleep(60 if self.paired() else 30)

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.8
+- Pannello diviso in tre schede: Richieste, Impianto, Preferenze. La pagina è molto più corta e il
+  numero sulla scheda Richieste indica le richieste ancora aperte.
+- Dopo ogni salvataggio il pannello torna alla sezione appena usata invece che all'inizio della pagina
+  (per esempio escludendo un'entità la lista resta dov'era).
+- Controllo solo delle entità con certe etichette di Home Assistant (dell'entità o del suo dispositivo):
+  le altre non vengono controllate né nominate all'installatore. Se le etichette non si possono leggere,
+  il controllo salta il giro invece di mandare entità escluse.
+- Il modulo per una nuova richiesta resta chiuso quando ce n'è già una in corso.
+- Accesso amministratore temporaneo per l'installatore, solo se il cliente lo concede (1 ora, 4 ore,
+  24 ore, 7 giorni o senza scadenza). L'utente in HA viene creato a ogni ingresso con una password nuova
+  (mai salvata), cancellato alla scadenza anche senza server, all'arresto dell'add-on e, senza scadenza,
+  dopo 30 giorni di inutilizzo; promemoria mensile e notifica al cliente a ogni ingresso.
+- Le notifiche al cliente dicono anche quale tecnico agisce, oltre al nome dell'azienda: chi chiede
+  l'accesso amministratore, chi entra, chi lo chiude, chi risponde a una richiesta e chi la prende in
+  carico. Anche l'utente creato in Home Assistant porta il nome del tecnico. Con un server più vecchio
+  resta solo il nome dell'azienda.
+- Tolta la barra di scorrimento che compariva accanto alle schede del pannello.
+- Assistenza sospesa: se il gestore del server sospende l'azienda dell'installatore, il pannello mostra
+  «Assistenza sospesa», l'abbinamento resta valido e tutto riparte da solo alla riattivazione. Durante la
+  sospensione l'eventuale accesso amministratore viene chiuso.
+- Corretto: in caso di collegamento revocato, sospeso o da aggiornare il pannello non richiede più le
+  richieste al server all'infinito per ridisegnarsi.
+
 ## 0.1.7
 - Il cliente può escludere entità dai controlli dell'installatore (anche con *, es. vacuum.robot_*):
   non vengono più controllate né nominate, l'installatore vede solo quante sono.

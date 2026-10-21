@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-AGENT_VERSION = "0.1.7"
+AGENT_VERSION = "0.1.8"
 PROTOCOL = 1
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
@@ -62,7 +62,7 @@ class State:
         "consent": True, "consent_until": None, "connection": "non_configurato", "last_error": None, "last_contact": None,
         "last_diag": None,
         # scelte del cliente nel pannello
-        "excluded": [], "flagged": [],
+        "excluded": [], "only_labels": [], "flagged": [], "admin": None,
         "ticket_retention": {"days": None, "max_closed": None},
         "notify": {"ha": True, "services": []},
         "tickets_seen": None, "tickets_updated": None,
@@ -176,7 +176,7 @@ class Link:
                           last_error=None)
         return res
 
-    def report(self, ha_version=None, diagnostics=None, ha_urls=None):
+    def report(self, ha_version=None, diagnostics=None, ha_urls=None, admin=None):
         consent = self.state.consent_active()
         until = self.state.get("consent_until") if consent else None
         body = {"consent": consent, "ha_version": ha_version,
@@ -185,6 +185,8 @@ class Link:
             body["diagnostics"] = diagnostics
         if ha_urls is not None:
             body["ha_urls"] = ha_urls
+        if admin is not None:
+            body["admin"] = admin
         res = self._request("POST", "/api/agent/report", body)
         branding = {k: str(res[k])[:100] for k in ("server_name", "brand_color")
                     if isinstance(res.get(k), str) and res[k] and res[k] != self.state.get(k)}

@@ -172,7 +172,7 @@ def _ws_recv(sock):
             length = struct.unpack("!H", _recv_exact(sock, 2))[0]
         elif length == 127:
             length = struct.unpack("!Q", _recv_exact(sock, 8))[0]
-        if length > 4 * 1024 * 1024:
+        if length > 16 * 1024 * 1024:
             raise HAError("messaggio websocket troppo grande")
         mask = _recv_exact(sock, 4) if b2 & 0x80 else None
         data = _recv_exact(sock, length)
@@ -189,6 +189,11 @@ def _ws_recv(sock):
 
 def ws_command(command, timeout=10, **params):
     """Esegue un comando websocket di Home Assistant e ne restituisce il risultato."""
+    return ws_commands([(command, params)], timeout)[0]
+
+
+def ws_commands(commands, timeout=10):
+    """Più comandi websocket sulla stessa connessione: [(tipo, {parametri}), ...] -> [risultati]."""
     url = urllib.parse.urlsplit(WS_URL)
     port = url.port or (443 if url.scheme == "wss" else 80)
     path = url.path or "/"
@@ -222,15 +227,20 @@ def ws_command(command, timeout=10, **params):
             msg = _ws_recv(sock)
             if msg.get("type") != "auth_ok":
                 raise HAError("autenticazione websocket non riuscita")
-        _ws_send(sock, {"id": 1, "type": command, **params})
+        for i, (command, params) in enumerate(commands, 1):
+            _ws_send(sock, {"id": i, "type": command, **(params or {})})
+        results = {}
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and len(results) < len(commands):
             msg = _ws_recv(sock)
-            if msg.get("id") == 1 and msg.get("type") == "result":
+            mid = msg.get("id")
+            if isinstance(mid, int) and 1 <= mid <= len(commands) and msg.get("type") == "result":
                 if not msg.get("success"):
-                    raise HAError(f"comando {command} non riuscito: {(msg.get('error') or {}).get('message')}")
-                return msg.get("result")
-        raise HAError(f"nessuna risposta al comando {command}")
+                    raise HAError(f"comando {commands[mid - 1][0]} non riuscito: {(msg.get('error') or {}).get('message')}")
+                results[mid] = msg.get("result")
+        if len(results) < len(commands):
+            raise HAError("nessuna risposta ai comandi websocket")
+        return [results[i] for i in range(1, len(commands) + 1)]
     except (OSError, ValueError) as e:
         raise HAError(f"websocket: {e}") from e
     finally:
@@ -238,6 +248,24 @@ def ws_command(command, timeout=10, **params):
             (sock.sock if isinstance(sock, _Conn) else sock).close()
         except OSError:
             pass
+
+
+def labels():
+    """Etichette definite in Home Assistant: {label_id: nome}."""
+    result = ws_command("config/label_registry/list")
+    return {l["label_id"]: l.get("name") or l["label_id"] for l in result or []
+            if isinstance(l, dict) and isinstance(l.get("label_id"), str)}
+
+
+def entity_labels():
+    """Etichette di ogni entità, comprese quelle del dispositivo a cui appartiene: {entity_id: {label_id}}."""
+    ents, devs = ws_commands([("config/entity_registry/list_for_display", {}), ("config/device_registry/list", {})], timeout=20)
+    dev_labels = {d["id"]: set(d.get("labels") or []) for d in devs or [] if isinstance(d, dict) and d.get("id")}
+    out = {}
+    for e in (ents or {}).get("entities", []) if isinstance(ents, dict) else []:
+        if isinstance(e, dict) and isinstance(e.get("ei"), str):
+            out[e["ei"]] = set(e.get("lb") or []) | dev_labels.get(e.get("di"), set())
+    return out
 
 
 def _clean_url(value):
