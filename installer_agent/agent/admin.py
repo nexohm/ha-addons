@@ -114,7 +114,8 @@ class AdminAccess:
         if was and reason != "cliente":
             msgs = {"scaduto": "è scaduto ed è stato chiuso automaticamente",
                     "installatore": (f"è stato chiuso da {self.agent._plain(person(by), 60)}" if person(by) else "è stato chiuso dall'installatore"),
-                    "scollegato": "è stato chiuso perché l'impianto non è più collegato all'assistenza"}
+                    "scollegato": "è stato chiuso perché l'impianto non è più collegato all'assistenza",
+                    "sospeso": "è stato chiuso perché l'assistenza è sospesa"}
             self.agent.notify_client(f"{self._plain_name()}: accesso amministratore chiuso",
                                      f"L'accesso amministratore di {self._plain_name()} {msgs.get(reason, 'è stato chiuso')}.",
                                      "admin")
@@ -210,6 +211,9 @@ class AdminAccess:
                 return
             if a["granted"] and not self.agent.paired():
                 self.close("scollegato")
+                return
+            if a["granted"] and self.state.get("connection") == "sospeso":
+                self.close("sospeso")
                 return
             if not a["granted"] and a["user_id"]:
                 self._delete_user()  # cancellazione rimasta in sospeso (es. HA non rispondeva)

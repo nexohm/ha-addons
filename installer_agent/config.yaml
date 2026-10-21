@@ -1,5 +1,5 @@
 name: Agente Assistenza (prova)
-version: "0.1.8-dev4"
+version: "0.1.8-dev5"
 slug: installer_agent
 description: Collega questo Home Assistant al servizio di assistenza del tuo installatore
 url: https://github.com/nexohm/ha-addons

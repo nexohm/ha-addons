@@ -32,6 +32,7 @@ CONNECTION_LABELS = {
     "errore": ("Non raggiungibile", "bad"),
     "revocato": ("Collegamento revocato", "bad"),
     "aggiornare": ("Aggiornare l'add-on", "bad"),
+    "sospeso": ("Assistenza sospesa", "off"),
 }
 
 CSS = """
@@ -402,7 +403,7 @@ class Panel:
                 f'<input type="hidden" name="tid" value="{t["id"]}"><input name="text" placeholder="Aggiungi un messaggio" style="flex:1">'
                 f'<button class="btn ghost">Invia</button></form></details>')
 
-    def page(self, section=""):
+    def page(self, section="", _redraw=True):
         s = self.agent.state.snapshot()
         name = s.get("server_name") or "Assistenza"
         conn_label, conn_cls = CONNECTION_LABELS.get(s.get("connection"), ("Sconosciuto", "off"))
@@ -419,16 +420,17 @@ class Panel:
             try:
                 tickets = self.agent.link.tickets()
             except ServerError as e:
-                if e.status in (401, 426):
+                if e.status in (401, 423, 426) and _redraw:
                     self.agent._handle_server_error(e)
-                    return self.page(section)  # ridisegna con lo stato aggiornato (revocato / da aggiornare)
+                    # ridisegna una volta sola con lo stato aggiornato (revocato / sospeso / da aggiornare)
+                    return self.page(section, _redraw=False)
                 tickets_error = f'<p class="muted">Richieste non disponibili: {esc(e)}</p>'
         open_count = sum(1 for t in tickets or [] if isinstance(t, dict) and t.get("status") != "chiuso")
         adm = self.agent.admin.get()
         admin_request = bool(adm["request"]) and adm["request"] != adm["declined"] and not self.agent.admin.active()
 
         error_html = ""
-        if s.get("connection") in ("errore", "non_configurato", "aggiornare", "revocato"):
+        if s.get("connection") in ("errore", "non_configurato", "aggiornare", "revocato", "sospeso"):
             hint = s.get("last_error") or "Inserisci indirizzo del server e codice di abbinamento nella configurazione dell'add-on."
             error_html = f'<div class="card"><h2>Collegamento</h2><p style="margin:0">{esc(hint)}</p></div>'
 

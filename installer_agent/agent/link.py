@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-AGENT_VERSION = "0.1.8-dev4"
+AGENT_VERSION = "0.1.8-dev5"
 PROTOCOL = 1
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")

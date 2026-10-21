@@ -188,6 +188,12 @@ class Agent:
                               last_error="L'installatore ha revocato il collegamento. Serve un nuovo codice di abbinamento.")
         elif e.status == 426:
             self.state.update(connection="aggiornare", last_error=str(e))
+        elif e.status == 423:
+            # azienda dell'installatore sospesa dal gestore del server: l'abbinamento resta, si riprova
+            # più tardi e quando l'azienda viene riattivata tutto riparte da solo
+            self.state.update(connection="sospeso",
+                              last_error="L'assistenza dell'installatore è sospesa: per ora non segue questo impianto. "
+                                         "Il collegamento riprenderà da solo quando verrà riattivata.")
         else:
             self.state.update(connection="errore", last_error=str(e))
 

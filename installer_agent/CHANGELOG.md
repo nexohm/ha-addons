@@ -18,6 +18,11 @@
   carico. Anche l'utente creato in Home Assistant porta il nome del tecnico. Con un server più vecchio
   resta solo il nome dell'azienda.
 - Tolta la barra di scorrimento che compariva accanto alle schede del pannello.
+- Assistenza sospesa: se il gestore del server sospende l'azienda dell'installatore, il pannello mostra
+  «Assistenza sospesa», l'abbinamento resta valido e tutto riparte da solo alla riattivazione. Durante la
+  sospensione l'eventuale accesso amministratore viene chiuso.
+- Corretto: in caso di collegamento revocato, sospeso o da aggiornare il pannello non richiede più le
+  richieste al server all'infinito per ridisegnarsi.
 
 ## 0.1.7
 - Il cliente può escludere entità dai controlli dell'installatore (anche con *, es. vacuum.robot_*):
