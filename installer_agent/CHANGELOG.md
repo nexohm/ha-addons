@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.9
+- Pannello Assistenza visibile a tutti gli utenti di Home Assistant, non solo agli amministratori. Chi non è
+  amministratore apre richieste e vede e risponde solo alle sue; stato dell'impianto, accesso remoto, entità
+  controllate, accesso amministratore e preferenze restano agli amministratori. Chi sia amministratore lo dice
+  Home Assistant: se non si riesce a saperlo, il pannello mostra la vista ridotta.
+- Le richieste e le risposte portano il nome dell'utente di Home Assistant che le scrive: l'installatore vede chi
+  ha aperto la richiesta, l'amministratore di casa vede «aperta da …» sulle richieste degli altri.
+- Comunicazioni dell'installatore (novità, manutenzioni, nuove funzioni) in cima alla scheda Richieste, per tutti
+  gli utenti di casa, con una notifica alla prima ricezione. Serve il server 0.2.8.
+- La diagnostica manda anche il nome leggibile delle entità non disponibili, per l'elenco nella dashboard
+  dell'installatore.
+
 ## 0.1.8
 - Pannello diviso in tre schede: Richieste, Impianto, Preferenze. La pagina è molto più corta e il
   numero sulla scheda Richieste indica le richieste ancora aperte.

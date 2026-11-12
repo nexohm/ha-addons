@@ -250,6 +250,18 @@ def ws_commands(commands, timeout=10):
             pass
 
 
+def users():
+    """Utenti di Home Assistant: {user_id: {"name", "admin"}}. Amministratore = proprietario o
+    gruppo system-admin; gli utenti di sistema e quelli disattivati non contano."""
+    out = {}
+    for u in ws_command("config/auth/list") or []:
+        if not isinstance(u, dict) or not isinstance(u.get("id"), str) or u.get("system_generated"):
+            continue
+        out[u["id"]] = {"name": u.get("name") or "", "active": u.get("is_active", True) is not False,
+                        "admin": bool(u.get("is_owner")) or "system-admin" in (u.get("group_ids") or [])}
+    return out
+
+
 def labels():
     """Etichette definite in Home Assistant: {label_id: nome}."""
     result = ws_command("config/label_registry/list")

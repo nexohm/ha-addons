@@ -25,11 +25,16 @@ server si trova nella rete di casa. Dopo l'abbinamento il codice non serve più.
 ## Il pannello Assistenza
 
 - **Richieste**: apri una richiesta di assistenza (il controllo dell'impianto viene allegato), leggi le risposte e
-  rispondi. Il numero sulla scheda indica le richieste ancora aperte.
+  rispondi. Il numero sulla scheda indica le richieste ancora aperte. In cima trovi le **comunicazioni** del tuo
+  installatore (novità, manutenzioni, nuove funzioni), con una notifica quando ne arriva una.
 - **Impianto**: stato del collegamento e dell'ultimo controllo; **accesso remoto** a tempo (1 ora, 4 ore, 24 ore,
   7 giorni o senza scadenza) oppure sospeso; **cosa controlla l'installatore**; **accesso amministratore**.
 - **Preferenze**: dove ricevere le notifiche (campanella di Home Assistant e/o telefono con l'app di Home Assistant
   o altri servizi `notify`) e quante richieste chiuse tenere nel pannello.
+
+Il pannello è visibile a **tutti gli utenti** di Home Assistant. Chi non è amministratore vede le comunicazioni,
+apre richieste e vede e risponde solo alle **sue**; l'installatore sa chi l'ha aperta. Le schede Impianto e
+Preferenze, con accesso remoto e accesso amministratore, restano agli amministratori.
 
 ## Cosa vede l'installatore
 
@@ -103,6 +108,11 @@ server on the home network. After pairing the code is no longer needed.
   24 hours, 7 days or no expiry) or suspended; **what the installer checks**; **administrator access**.
 - **Preferenze** (Preferences): where notifications go (Home Assistant bell and/or phone through the Home Assistant
   app or other `notify` services) and how many closed requests to keep in the panel.
+
+At the top of the Requests tab you find your installer's **announcements** (news, maintenance, new features), with
+a notification when a new one arrives. The panel is visible to **every** Home Assistant user: non-administrators
+see announcements, open requests and see and answer only **their own** (the installer knows who opened them).
+The System and Preferences tabs, with remote access and administrator access, stay with administrators.
 
 ## What the installer sees
 

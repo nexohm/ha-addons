@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-AGENT_VERSION = "0.1.8"
+AGENT_VERSION = "0.1.9-dev1"
 PROTOCOL = 1
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
@@ -66,6 +66,10 @@ class State:
         "ticket_retention": {"days": None, "max_closed": None},
         "notify": {"ha": True, "services": []},
         "tickets_seen": None, "tickets_updated": None,
+        # richieste aperte da questo pannello: {id richiesta: id utente di HA} (vale anche con server vecchi)
+        "ticket_owners": {},
+        # comunicazioni dell'installatore
+        "notices": [], "notices_key": None, "notices_seen": None,
     }
 
     def __init__(self):
@@ -206,9 +210,19 @@ class Link:
         tickets = self._request("GET", "/api/agent/tickets").get("tickets")
         return tickets if isinstance(tickets, list) else []
 
-    def open_ticket(self, title, description, contact, diagnostics):
-        return self._request("POST", "/api/agent/tickets", {
-            "title": title, "description": description, "contact": contact, "diagnostics": diagnostics})
+    def open_ticket(self, title, description, contact, diagnostics, user=None):
+        body = {"title": title, "description": description, "contact": contact, "diagnostics": diagnostics}
+        if user:
+            body["user"] = user
+        return self._request("POST", "/api/agent/tickets", body)
 
-    def reply_ticket(self, tid, text):
-        return self._request("POST", f"/api/agent/tickets/{tid}/messages", {"text": text})
+    def reply_ticket(self, tid, text, user=None):
+        body = {"text": text}
+        if user:
+            body["user"] = user
+        return self._request("POST", f"/api/agent/tickets/{tid}/messages", body)
+
+    def notices(self):
+        res = self._request("GET", "/api/agent/notices")
+        notices = res.get("notices")
+        return (notices if isinstance(notices, list) else []), res.get("key")

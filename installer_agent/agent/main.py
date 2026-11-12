@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+from datetime import datetime
 
 from . import diagnostics, ha
 from .admin import AdminAccess, person
@@ -51,6 +52,8 @@ class Agent:
         self._urls, self._urls_at = None, 0.0
         self._send_diag_now = False
         self._last_ticket_check = 0.0
+        self._users, self._users_at = None, 0.0
+        self._users_lock = threading.Lock()
         self.admin = AdminAccess(self)
 
     # ---- utilità ----
@@ -176,6 +179,68 @@ class Agent:
         # teniamo solo i ticket recenti per non far crescere lo stato all'infinito
         self.state.update(tickets_seen=dict(list(new_seen.items())[-200:]), tickets_updated=tickets_updated)
 
+    # ---- utenti di Home Assistant che aprono il pannello ----
+
+    def panel_user(self, user_id, header_name=None):
+        """Chi sta usando il pannello. L'ingress di Home Assistant manda l'id dell'utente collegato
+        (X-Remote-User-Id); se è amministratore lo dice Home Assistant stesso. Senza id, o se Home
+        Assistant non risponde, si va sul sicuro: vista da utente normale."""
+        if not isinstance(user_id, str) or not re.fullmatch(r"[0-9a-f]{32}", user_id):
+            return {"id": None, "name": None, "admin": False}
+        with self._users_lock:
+            now = time.monotonic()
+            if self._users is None or now - self._users_at > 60 or user_id not in self._users:
+                try:
+                    self._users, self._users_at = ha.users(), now
+                except ha.HAError as e:
+                    log.warning("Utenti di Home Assistant non letti: %s", e)
+                    if self._users is None:
+                        self._users = {}
+            info = self._users.get(user_id) or {}
+        name = person(info.get("name") or header_name) or "Utente"
+        return {"id": user_id, "name": name, "admin": bool(info.get("admin")) and info.get("active", True)}
+
+    # ---- comunicazioni dell'installatore ----
+
+    NOTICE_FRESH_DAYS = 2   # al primo controllo si notificano solo quelle di questi ultimi giorni
+
+    def check_notices(self, key):
+        """Rilegge le comunicazioni se l'impronta mandata dal server è cambiata e avvisa il cliente
+        di quelle nuove. Tutto quello che arriva dal server viene ripulito e accorciato."""
+        if key == self.state.get("notices_key") and self.state.get("notices_seen") is not None:
+            return
+        if key is None:
+            self.state.update(notices=[], notices_key=None, notices_seen=self.state.get("notices_seen") or [])
+            return
+        try:
+            raw, key = self.link.notices()
+        except ServerError as e:
+            log.warning("Comunicazioni non lette: %s", e)
+            return
+        notices = []
+        for n in raw[:20]:
+            if not isinstance(n, dict) or not isinstance(n.get("id"), int):
+                continue
+            notices.append({"id": n["id"], "title": str(n.get("title") or "")[:120], "text": str(n.get("text") or "")[:2000],
+                            "author": person(n.get("author_name")), "created_at": str(n.get("created_at") or "")[:40]})
+        seen = self.state.get("notices_seen")
+        name = self._plain(self.state.get("server_name") or "Assistenza", 60)
+        now = time.time()
+        for n in reversed(notices):
+            if seen is not None and n["id"] in seen:
+                continue
+            if seen is None:
+                try:
+                    age = now - datetime.fromisoformat(n["created_at"]).timestamp()
+                except ValueError:
+                    continue
+                if age > self.NOTICE_FRESH_DAYS * 86400:
+                    continue
+            self.notify_client(f"{name}: {self._plain(n['title'], 80)}", self._plain(n["text"], 300), f"comunicazione_{n['id']}")
+        ids = [n["id"] for n in notices]
+        self.state.update(notices=notices, notices_key=key,
+                          notices_seen=sorted(set(ids) | set(seen or []))[-200:])
+
     def paired(self):
         return bool(self.state.get("token")) and self.state.get("connection") not in ("revocato", "aggiornare")
 
@@ -249,6 +314,8 @@ class Agent:
                 self.state.update(connection="collegato", last_error=None, last_contact=time.time())
                 self.admin.on_server_request(res.get("admin_requested"), res.get("admin_requested_by"))
                 self.check_ticket_updates(res.get("tickets_updated"), server_tells="tickets_updated" in res)
+                if "notices" in res:   # server che conosce le comunicazioni
+                    self.check_notices(res.get("notices"))
                 failures = 0
                 wait = self.options["heartbeat_seconds"]
             except ServerError as e:

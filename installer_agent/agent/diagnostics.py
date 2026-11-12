@@ -54,10 +54,15 @@ def collect(excluded=(), only_labels=None, labels_of=None):
     flagged = []
     excluded_count = 0
 
+    names = {}   # nome leggibile delle entità nominate, per l'elenco della dashboard dell'installatore
+
     def issue(severity, code, message, items=None):
         entry = {"severity": severity, "code": code, "message": message}
         if items:
             entry["items"] = items[:MAX_ITEMS]
+            known = {i: names[i] for i in entry["items"] if i in names}
+            if known:
+                entry["names"] = known
         issues.append(entry)
 
     all_states = ha.states()
@@ -82,6 +87,8 @@ def collect(excluded=(), only_labels=None, labels_of=None):
         if state == "unavailable" and domain not in IGNORE_UNAVAILABLE:
             # "restored" = entità rimasta nel registro ma la cui integrazione non la fornisce più
             (orphans if attrs.get("restored") else unavailable).append(eid)
+            if attrs.get("friendly_name"):
+                names[eid] = str(attrs["friendly_name"])[:120]
             flag("orfana" if attrs.get("restored") else "non disponibile")
 
         if attrs.get("device_class") == "battery":
