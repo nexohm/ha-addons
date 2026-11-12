@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-AGENT_VERSION = "0.1.9-dev1"
+AGENT_VERSION = "0.1.9-dev2"
 PROTOCOL = 1
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
@@ -70,6 +70,10 @@ class State:
         "ticket_owners": {},
         # comunicazioni dell'installatore
         "notices": [], "notices_key": None, "notices_seen": None,
+        # letture delle comunicazioni: {id: {"at": epoch, "by": nome}} e quelle ancora da comunicare al server
+        "notices_read": {}, "notices_read_pending": [],
+        # backup e aggiornamenti avviati dall'installatore (ultimi 10)
+        "jobs": [],
     }
 
     def __init__(self):
@@ -180,7 +184,7 @@ class Link:
                           last_error=None)
         return res
 
-    def report(self, ha_version=None, diagnostics=None, ha_urls=None, admin=None):
+    def report(self, ha_version=None, diagnostics=None, ha_urls=None, admin=None, notices_read=None, jobs=None):
         consent = self.state.consent_active()
         until = self.state.get("consent_until") if consent else None
         body = {"consent": consent, "ha_version": ha_version,
@@ -191,6 +195,10 @@ class Link:
             body["ha_urls"] = ha_urls
         if admin is not None:
             body["admin"] = admin
+        if notices_read:
+            body["notices_read"] = notices_read
+        if jobs is not None:
+            body["jobs"] = jobs
         res = self._request("POST", "/api/agent/report", body)
         branding = {k: str(res[k])[:100] for k in ("server_name", "brand_color")
                     if isinstance(res.get(k), str) and res[k] and res[k] != self.state.get(k)}

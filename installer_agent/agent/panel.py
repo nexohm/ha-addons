@@ -512,19 +512,23 @@ class Panel:
 
     # ---- schede ----
 
-    def _notices_html(self, s):
-        """Comunicazioni dell'installatore: le vede chiunque apra il pannello. La più recente è aperta."""
-        notices = [n for n in s.get("notices") or [] if isinstance(n, dict) and isinstance(n.get("id"), int)]
+    def _notices_html(self, s, user=None):
+        """Comunicazioni dell'installatore: le vede chiunque apra il pannello. La più recente è aperta.
+        Mostrarle vale come lettura: 30 minuti dopo la prima lettura spariscono dal pannello."""
+        notices = [n for n in self.agent.visible_notices() if isinstance(n.get("id"), int)][:10]
         if not notices:
             return ""
+        self.agent.mark_notices_read([n["id"] for n in notices], user)
         name = esc(s.get("server_name") or "dell&#39;installatore")
         rows = ""
-        for i, n in enumerate(notices[:10]):
+        for i, n in enumerate(notices):
             by = f" · {esc(n.get('author'))}" if n.get("author") else ""
             rows += (f'<details id="c{n["id"]}"{" open" if i == 0 else ""}><summary><b>{esc(n.get("title"))}</b> '
                      f'<span class="muted small">{fmt(n.get("created_at"))}{by}</span></summary>'
                      f'<p class="text">{esc(n.get("text"))}</p></details>')
-        return f'<div class="card notice" id="comunicazioni"><h2>Comunicazioni di {name}</h2>{rows}</div>'
+        minutes = max(1, self.agent.NOTICE_HIDE_SECONDS // 60)
+        return (f'<div class="card notice" id="comunicazioni"><h2>Comunicazioni di {name}</h2>{rows}'
+                f'<p class="muted small" style="margin:6px 0 0">Spariscono da qui {minutes} minuti dopo essere state lette.</p></div>')
 
     def _section_richieste(self, s, tickets, tickets_error, open_count, user=None):
         user = user or {}
@@ -551,7 +555,7 @@ class Panel:
 <p class="muted small">{"Alla richiesta viene allegato un controllo automatico dell&#39;impianto." if consent else ""}</p>
 <button class="btn">Invia richiesta</button></form></details>"""
         heading = "Richieste di casa" if user.get("admin") else "Le tue richieste"
-        return f'{self._notices_html(s)}{new_form}<div class="card" id="richieste"><h2>{heading}</h2>{tickets_html}</div>'
+        return f'{self._notices_html(s, user)}{new_form}<div class="card" id="richieste"><h2>{heading}</h2>{tickets_html}</div>'
 
     def _section_impianto(self, s, paired):
         diag = s.get("last_diag") or {}

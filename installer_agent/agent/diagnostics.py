@@ -39,6 +39,88 @@ def _parse(ts):
         return None
 
 
+UPDATE_INSTALL = 1   # supported_features delle entità update: si può installare da remoto
+
+
+def update_kind(entity_id, attrs):
+    """Che cosa aggiorna un'entità update: Home Assistant, sistema operativo, Supervisor, add-on o altro
+    (integrazioni HACS, firmware di dispositivi, ESPHome...)."""
+    if entity_id == "update.home_assistant_core_update":
+        return "core"
+    if entity_id == "update.home_assistant_operating_system_update":
+        return "os"
+    if entity_id == "update.home_assistant_supervisor_update":
+        return "supervisor"
+    if "/hassio/addons/" in str(attrs.get("entity_picture") or ""):
+        return "addon"
+    return "altro"
+
+
+def _location(agent_id):
+    """Dove è salvato un backup, in parole semplici."""
+    if agent_id in ("hassio.local", "backup.local"):
+        return "Questo dispositivo"
+    if agent_id == "cloud.cloud":
+        return "Home Assistant Cloud"
+    return str(agent_id).split(".", 1)[-1][:60]
+
+
+def backup_status(supervisor_backups=None):
+    """Backup presenti e stato del backup automatico.
+
+    Da Home Assistant 2025.1 il sistema di backup (backup/info) conosce anche le posizioni esterne (NAS,
+    cloud) e il backup automatico; con versioni precedenti si usa l'elenco del Supervisor."""
+    out = {"items": [], "automatic": None}
+    try:
+        info = ha.ws_command("backup/info", timeout=15)
+    except ha.HAError:
+        info = None
+    if isinstance(info, dict) and isinstance(info.get("backups"), list):
+        for b in info["backups"]:
+            if not isinstance(b, dict):
+                continue
+            agents = b.get("agents") if isinstance(b.get("agents"), dict) else {a: {} for a in b.get("agent_ids") or []}
+            sizes = [v.get("size") for v in agents.values() if isinstance(v, dict) and isinstance(v.get("size"), (int, float))]
+            size = b.get("size") if isinstance(b.get("size"), (int, float)) else (max(sizes) if sizes else None)
+            # completo = configurazione di Home Assistant con il suo database (gli add-on possono mancare)
+            full = b.get("homeassistant_included") is not False and b.get("database_included") is not False
+            out["items"].append({"name": str(b.get("name") or "")[:80], "date": b.get("date"),
+                                 "size_mb": round(size / 1048576, 1) if size else None,
+                                 "kind": "completo" if full else "parziale",
+                                 "locations": [_location(a) for a in agents][:5],
+                                 "automatic": bool(b.get("with_automatic_settings")),
+                                 "protected": bool(b.get("protected"))})
+        auto = {k: info.get(k) for k in ("last_attempted_automatic_backup", "last_completed_automatic_backup",
+                                         "next_automatic_backup") if isinstance(info.get(k), str)}
+        try:
+            cfg = (ha.ws_command("backup/config/info", timeout=15) or {}).get("config") or {}
+        except ha.HAError:
+            cfg = {}
+        schedule = cfg.get("schedule") if isinstance(cfg.get("schedule"), dict) else {}
+        retention = cfg.get("retention") if isinstance(cfg.get("retention"), dict) else {}
+        create = cfg.get("create_backup") if isinstance(cfg.get("create_backup"), dict) else {}
+        auto.update(recurrence=schedule.get("recurrence") if isinstance(schedule.get("recurrence"), str) else None,
+                    days=[d for d in schedule.get("days") or [] if isinstance(d, str)][:7],
+                    time=schedule.get("time") if isinstance(schedule.get("time"), str) else None,
+                    copies=retention.get("copies") if isinstance(retention.get("copies"), int) else None,
+                    retention_days=retention.get("days") if isinstance(retention.get("days"), int) else None,
+                    locations=[_location(a) for a in create.get("agent_ids") or []][:5])
+        out["automatic"] = auto
+    elif supervisor_backups:
+        for b in supervisor_backups:
+            if not isinstance(b, dict):
+                continue
+            locs = b.get("locations") or [b.get("location")]
+            out["items"].append({"name": str(b.get("name") or "")[:80], "date": b.get("date"),
+                                 "size_mb": b.get("size") if isinstance(b.get("size"), (int, float)) else None,
+                                 "kind": "completo" if b.get("type") == "full" else "parziale",
+                                 "locations": ["Questo dispositivo" if not l or l == ".local" else str(l)[:60] for l in locs][:5],
+                                 "automatic": None, "protected": bool(b.get("protected"))})
+    out["items"].sort(key=lambda i: str(i.get("date") or ""), reverse=True)
+    out["items"] = out["items"][:15]
+    return out
+
+
 def is_excluded(entity_id, patterns):
     """Entità esclusa dal cliente: nome esatto oppure modello con * (es. sensor.robot_*)."""
     return any(fnmatch.fnmatchcase(entity_id, p) for p in patterns)
@@ -68,6 +150,7 @@ def collect(excluded=(), only_labels=None, labels_of=None):
     all_states = ha.states()
 
     unavailable, orphans, low_battery, updates, automations_off = [], [], [], [], []
+    updates_list = []   # aggiornamenti in forma strutturata: l'installatore li può installare da remoto
     for s in all_states:
         eid = s["entity_id"]
         if excluded and is_excluded(eid, excluded):
@@ -103,6 +186,10 @@ def collect(excluded=(), only_labels=None, labels_of=None):
         if domain == "update" and state == "on":
             installed, latest = attrs.get("installed_version"), attrs.get("latest_version")
             updates.append(f"{_name(s)} {installed or ''} → {latest or ''}".strip())
+            updates_list.append({"entity_id": eid, "title": str(attrs.get("title") or _name(s))[:80],
+                                 "installed": str(installed or "")[:40], "latest": str(latest or "")[:40],
+                                 "kind": update_kind(eid, attrs), "in_progress": bool(attrs.get("in_progress")),
+                                 "installable": bool(int(attrs.get("supported_features") or 0) & UPDATE_INSTALL)})
 
         if domain == "automation" and state == "off":
             automations_off.append(_name(s))
@@ -143,6 +230,7 @@ def collect(excluded=(), only_labels=None, labels_of=None):
             issue("attenzione", "disk_high", f"Disco occupato all'{pct:.0f}%")
 
     backups = ha.supervisor("backups")
+    backups_info = backup_status((backups or {}).get("backups"))
     if backups is not None:
         dates = [d for d in (_parse(b.get("date")) for b in backups.get("backups", [])) if d]
         if dates:
@@ -174,5 +262,7 @@ def collect(excluded=(), only_labels=None, labels_of=None):
         },
         "system": system,
         "issues": issues,
+        "updates_list": updates_list[:50],
+        "backups": backups_info,
         "_flagged": flagged[:200],
     }

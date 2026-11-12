@@ -72,8 +72,26 @@ def _post(url, body, timeout=15):
         raise HAError(f"{url}: {e}") from e
 
 
-def call_service(domain, service, data):
-    return _post(f"{HA_URL}/services/{domain}/{service}", data)
+def call_service(domain, service, data, timeout=15):
+    return _post(f"{HA_URL}/services/{domain}/{service}", data, timeout)
+
+
+def state(entity_id):
+    """Stato di una singola entità, o None se non esiste."""
+    try:
+        return _get(f"{HA_URL}/states/{urllib.parse.quote(entity_id)}")
+    except HAError as e:
+        if "404" in str(e):
+            return None
+        raise
+
+
+def supervisor_post(path, body, timeout=15):
+    """Richiesta POST al Supervisor: restituisce il campo 'data', solleva HAError se fallisce."""
+    res = _post(f"{SUPERVISOR_URL}/{path.lstrip('/')}", body, timeout)
+    if isinstance(res, dict) and res.get("result") == "ok":
+        return res.get("data")
+    raise HAError(f"il Supervisor ha risposto: {(res or {}).get('message') if isinstance(res, dict) else res}")
 
 
 # Servizi notify da non proporre al cliente: la campanella è già un'opzione a parte,

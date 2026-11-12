@@ -13,10 +13,11 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from . import diagnostics, ha
 from .admin import AdminAccess, person
+from .jobs import Jobs
 from .link import AGENT_VERSION, DATA_DIR, Link, ServerError, State
 from .panel import Panel
 
@@ -54,7 +55,9 @@ class Agent:
         self._last_ticket_check = 0.0
         self._users, self._users_at = None, 0.0
         self._users_lock = threading.Lock()
+        self._reads_lock = threading.Lock()   # letture delle comunicazioni: pannello e rapporti
         self.admin = AdminAccess(self)
+        self.jobs = Jobs(self)
 
     # ---- utilità ----
 
@@ -203,6 +206,40 @@ class Agent:
     # ---- comunicazioni dell'installatore ----
 
     NOTICE_FRESH_DAYS = 2   # al primo controllo si notificano solo quelle di questi ultimi giorni
+    # dopo quanto, dalla prima lettura nel pannello, una comunicazione sparisce dal pannello del cliente
+    NOTICE_HIDE_SECONDS = int(os.environ.get("NOTICE_HIDE_SECONDS", "1800"))
+
+    def visible_notices(self):
+        """Comunicazioni da mostrare: tutte tranne quelle lette da più di 30 minuti (sul server restano)."""
+        read = self.state.get("notices_read") or {}
+        now = time.time()
+        return [n for n in self.state.get("notices") or [] if isinstance(n, dict)
+                and not (str(n.get("id")) in read and now - read[str(n.get("id"))].get("at", now) >= self.NOTICE_HIDE_SECONDS)]
+
+    def mark_notices_read(self, ids, user):
+        """Comunicazioni appena viste nel pannello: si ricorda la prima lettura, la si manda al server
+        al prossimo rapporto e si toglie la notifica dalla campanella di Home Assistant."""
+        with self._reads_lock:
+            read = dict(self.state.get("notices_read") or {})
+            new = [i for i in ids if isinstance(i, int) and str(i) not in read]
+            if not new:
+                return
+            now = time.time()
+            by = (user or {}).get("name")
+            pending = list(self.state.get("notices_read_pending") or [])
+            for i in new:
+                read[str(i)] = {"at": now, "by": by}
+                pending.append({"id": i, "at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"), "by": by})
+            self.state.update(notices_read=read, notices_read_pending=pending[-100:])
+
+        def dismiss():
+            for i in new:
+                try:
+                    ha.call_service("persistent_notification", "dismiss", {"notification_id": f"assistenza_comunicazione_{i}"})
+                except ha.HAError as e:
+                    log.warning("Notifica della comunicazione %s non tolta: %s", i, e)
+        threading.Thread(target=dismiss, daemon=True, name="dismiss").start()
+        self.wake()
 
     def check_notices(self, key):
         """Rilegge le comunicazioni se l'impronta mandata dal server è cambiata e avvisa il cliente
@@ -238,8 +275,10 @@ class Agent:
                     continue
             self.notify_client(f"{name}: {self._plain(n['title'], 80)}", self._plain(n["text"], 300), f"comunicazione_{n['id']}")
         ids = [n["id"] for n in notices]
-        self.state.update(notices=notices, notices_key=key,
-                          notices_seen=sorted(set(ids) | set(seen or []))[-200:])
+        with self._reads_lock:
+            read = {k: v for k, v in (self.state.get("notices_read") or {}).items() if k.isdigit() and int(k) in ids}
+            self.state.update(notices=notices, notices_key=key, notices_read=read,
+                              notices_seen=sorted(set(ids) | set(seen or []))[-200:])
 
     def paired(self):
         return bool(self.state.get("token")) and self.state.get("connection") not in ("revocato", "aggiornare")
@@ -310,7 +349,12 @@ class Agent:
             self._send_diag_now = False
             try:
                 urls = self.ha_urls()
-                res = self.link.report(self.ha_version(), diag, urls, self.admin.status()) or {}
+                sent_reads = list(self.state.get("notices_read_pending") or [])
+                res = self.link.report(self.ha_version(), diag, urls, self.admin.status(), sent_reads, self.jobs.status()) or {}
+                if sent_reads:   # letture consegnate: restano in coda solo quelle arrivate nel frattempo
+                    with self._reads_lock:
+                        self.state.update(notices_read_pending=[r for r in self.state.get("notices_read_pending") or []
+                                                                if r not in sent_reads])
                 self.state.update(connection="collegato", last_error=None, last_contact=time.time())
                 self.admin.on_server_request(res.get("admin_requested"), res.get("admin_requested_by"))
                 self.check_ticket_updates(res.get("tickets_updated"), server_tells="tickets_updated" in res)
@@ -328,7 +372,7 @@ class Agent:
 
     # ---- ciclo dei comandi ----
 
-    COMMANDS = {"ping", "run_diagnostics", "admin_password", "admin_close"}
+    COMMANDS = {"ping", "run_diagnostics", "admin_password", "admin_close", "create_backup", "install_update"}
 
     def execute(self, cmd):
         name = cmd.get("name")
@@ -352,6 +396,11 @@ class Agent:
             return False, None, "accesso remoto sospeso dal cliente"
         if name == "run_diagnostics":
             return True, self.fresh_diagnostics(), None
+        # backup e aggiornamenti: rispondono subito, il lavoro continua in background
+        if name == "create_backup":
+            return self.jobs.start(cmd["id"], "backup", args)
+        if name == "install_update":
+            return self.jobs.start(cmd["id"], "update", args)
         return False, None, "comando non gestito"
 
     def command_loop(self):
@@ -398,6 +447,10 @@ class Agent:
             log.info("Chiave del Supervisor trovata (%s)", ha.TOKEN_SOURCE)
         else:
             log.error("Chiave del Supervisor NON trovata: la diagnostica non potrà leggere Home Assistant")
+        try:
+            self.jobs.recover()
+        except Exception:  # noqa: BLE001
+            log.exception("Controllo delle operazioni rimaste in corso non riuscito")
         Panel(self, int(os.environ.get("PANEL_PORT", "8099"))).start()
         threading.Thread(target=self.report_loop, daemon=True, name="report").start()
         threading.Thread(target=self.command_loop, daemon=True, name="commands").start()

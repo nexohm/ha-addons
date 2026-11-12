@@ -39,6 +39,9 @@ Preferenze, con accesso remoto e accesso amministratore, restano agli amministra
 ## Cosa vede l'installatore
 
 - se l'impianto è acceso e collegato;
+- i backup presenti, lo stato del backup automatico e gli aggiornamenti disponibili. **Con l'accesso remoto attivo**
+  può avviare un backup completo o installare un aggiornamento: prima di ogni aggiornamento viene sempre fatto un
+  backup completo, e ricevi una notifica all'inizio e alla fine;
 - un controllo automatico: dispositivi non raggiungibili, batterie scariche, aggiornamenti disponibili, automazioni
   spente, spazio su disco, data dell'ultimo backup.
 
@@ -116,6 +119,9 @@ The System and Preferences tabs, with remote access and administrator access, st
 
 ## What the installer sees
 
+- the backups, the automatic backup status and the available updates. **With remote access on** they can start a
+  full backup or install an update: a full backup is always made before every update, and you get a notification
+  when it starts and when it ends;
 - whether the system is up and connected;
 - an automatic check: unreachable devices, low batteries, pending updates, disabled automations, disk space, date
   of the last backup.
