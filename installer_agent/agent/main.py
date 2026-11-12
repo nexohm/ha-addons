@@ -103,12 +103,21 @@ class Agent:
 
     @staticmethod
     def _plain(text, limit=300):
-        """Testo che arriva dal server, ripulito per le notifiche di Home Assistant (che interpretano
-        il Markdown): niente link, immagini o formattazione decise dal server."""
+        """Testo che arriva dal server, ripulito per le notifiche: niente tag HTML (l'app Android li
+        interpreta), una riga sola, accorciato. L'escape del Markdown lo fa notify_client solo per la
+        campanella: sul telefono le barre comparirebbero tali e quali."""
         text = re.sub(r"<[^>]*>", "", str(text or ""))
-        text = re.sub(r"([\\`*_{}\[\]()#+!|>~])", r"\\\1", text)
+        # link e immagini Markdown ([testo](indirizzo), ![x](indirizzo)) diventano testo con l'indirizzo
+        # in vista: alcuni servizi notify (Telegram, Discord) il Markdown lo interpretano
+        text = re.sub(r"!?\[([^\]]*)\]\(([^)]*)\)", r"\1 (\2)", text)
+        text = text.replace("](", "] (")
         text = " ".join(text.split())
         return text[:limit] + ("…" if len(text) > limit else "")
+
+    @staticmethod
+    def _md(text):
+        """Escape del Markdown per la campanella di Home Assistant: niente link, immagini o formattazione."""
+        return re.sub(r"([\\`*_{}\[\]()#+!|>~<])", r"\\\1", str(text or ""))
 
     def notify_client(self, title, message, tag):
         settings = self.state.get("notify") or {}
@@ -116,7 +125,7 @@ class Agent:
         if settings.get("ha", True):
             try:
                 ha.call_service("persistent_notification", "create",
-                                {"title": title, "message": message, "notification_id": f"assistenza_{tag}"})
+                                {"title": self._md(title), "message": self._md(message), "notification_id": f"assistenza_{tag}"})
                 sent += 1
             except ha.HAError as e:
                 log.warning("Notifica in Home Assistant non riuscita: %s", e)
@@ -216,10 +225,40 @@ class Agent:
         return [n for n in self.state.get("notices") or [] if isinstance(n, dict)
                 and not (str(n.get("id")) in read and now - read[str(n.get("id"))].get("at", now) >= self.NOTICE_HIDE_SECONDS)]
 
+    def _dismiss(self, ids):
+        """Toglie dalla campanella di Home Assistant le notifiche di queste comunicazioni (in background)."""
+        ids = [i for i in ids if isinstance(i, int)]
+        if not ids:
+            return
+
+        def run():
+            for i in ids:
+                try:
+                    ha.call_service("persistent_notification", "dismiss", {"notification_id": f"assistenza_comunicazione_{i}"})
+                except ha.HAError as e:
+                    log.warning("Notifica della comunicazione %s non tolta: %s", i, e)
+        threading.Thread(target=run, daemon=True, name="dismiss").start()
+
+    def unread_notices(self, user):
+        """Comunicazioni visibili che questo utente non ha ancora visto nel pannello (per «Nuova» e il numero)."""
+        viewers = self.state.get("notices_viewers") or {}
+        uid = (user or {}).get("id") or ""
+        return [n["id"] for n in self.visible_notices() if uid not in (viewers.get(str(n.get("id"))) or [])]
+
     def mark_notices_read(self, ids, user):
         """Comunicazioni appena viste nel pannello: si ricorda la prima lettura, la si manda al server
         al prossimo rapporto e si toglie la notifica dalla campanella di Home Assistant."""
         with self._reads_lock:
+            uid = (user or {}).get("id") or ""
+            viewers = dict(self.state.get("notices_viewers") or {})
+            changed = False
+            for i in ids:
+                seen_by = list(viewers.get(str(i)) or [])
+                if isinstance(i, int) and uid not in seen_by:
+                    viewers[str(i)] = (seen_by + [uid])[-20:]
+                    changed = True
+            if changed:
+                self.state.update(notices_viewers=viewers)
             read = dict(self.state.get("notices_read") or {})
             new = [i for i in ids if isinstance(i, int) and str(i) not in read]
             if not new:
@@ -231,14 +270,7 @@ class Agent:
                 read[str(i)] = {"at": now, "by": by}
                 pending.append({"id": i, "at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"), "by": by})
             self.state.update(notices_read=read, notices_read_pending=pending[-100:])
-
-        def dismiss():
-            for i in new:
-                try:
-                    ha.call_service("persistent_notification", "dismiss", {"notification_id": f"assistenza_comunicazione_{i}"})
-                except ha.HAError as e:
-                    log.warning("Notifica della comunicazione %s non tolta: %s", i, e)
-        threading.Thread(target=dismiss, daemon=True, name="dismiss").start()
+        self._dismiss(new)
         self.wake()
 
     def check_notices(self, key):
@@ -247,7 +279,10 @@ class Agent:
         if key == self.state.get("notices_key") and self.state.get("notices_seen") is not None:
             return
         if key is None:
-            self.state.update(notices=[], notices_key=None, notices_seen=self.state.get("notices_seen") or [])
+            # nessuna comunicazione (tutte eliminate dall'installatore): via anche dalla campanella
+            self._dismiss([n.get("id") for n in self.state.get("notices") or [] if isinstance(n, dict)])
+            self.state.update(notices=[], notices_key=None, notices_seen=self.state.get("notices_seen") or [],
+                              notices_read={}, notices_viewers={})
             return
         try:
             raw, key = self.link.notices()
@@ -275,9 +310,12 @@ class Agent:
                     continue
             self.notify_client(f"{name}: {self._plain(n['title'], 80)}", self._plain(n["text"], 300), f"comunicazione_{n['id']}")
         ids = [n["id"] for n in notices]
+        # comunicazioni eliminate dall'installatore: la loro notifica non deve restare nella campanella
+        self._dismiss([n.get("id") for n in self.state.get("notices") or [] if isinstance(n, dict) and n.get("id") not in ids])
         with self._reads_lock:
             read = {k: v for k, v in (self.state.get("notices_read") or {}).items() if k.isdigit() and int(k) in ids}
-            self.state.update(notices=notices, notices_key=key, notices_read=read,
+            viewers = {k: v for k, v in (self.state.get("notices_viewers") or {}).items() if k.isdigit() and int(k) in ids}
+            self.state.update(notices=notices, notices_key=key, notices_read=read, notices_viewers=viewers,
                               notices_seen=sorted(set(ids) | set(seen or []))[-200:])
 
     def paired(self):

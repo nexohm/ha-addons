@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-AGENT_VERSION = "0.1.9-dev2"
+AGENT_VERSION = "0.1.9-dev3"
 PROTOCOL = 1
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
@@ -72,6 +72,8 @@ class State:
         "notices": [], "notices_key": None, "notices_seen": None,
         # letture delle comunicazioni: {id: {"at": epoch, "by": nome}} e quelle ancora da comunicare al server
         "notices_read": {}, "notices_read_pending": [],
+        # chi ha già visto ogni comunicazione nel pannello: {id: [id utente HA]} (per «Nuova» a ognuno)
+        "notices_viewers": {},
         # backup e aggiornamenti avviati dall'installatore (ultimi 10)
         "jobs": [],
     }

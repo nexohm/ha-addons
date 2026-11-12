@@ -2,7 +2,8 @@ ARG BUILD_FROM
 FROM $BUILD_FROM
 
 # L'agente usa solo la libreria standard di Python: nessuna dipendenza da scaricare.
-RUN apk add --no-cache python3
+# tzdata: i fusi orari, per mostrare le ore come in Home Assistant e non in UTC.
+RUN apk add --no-cache python3 tzdata
 
 WORKDIR /app
 COPY agent ./agent

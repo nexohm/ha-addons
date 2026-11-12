@@ -11,7 +11,7 @@ import secrets
 import threading
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import ha
@@ -83,6 +83,8 @@ details.card{border-top:1px solid var(--line);padding:18px}details.card summary{
 .warnbox{background:var(--warnb);color:var(--ink);border-left:4px solid var(--warn);border-radius:8px;padding:10px 12px;margin:0 0 10px}
 .btn.small{padding:4px 10px;font-size:.85rem}.check{display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0}.check input{width:auto}
 .notice{border-left:4px solid var(--brand)}.notice details{padding:10px 0}.notice .text{white-space:pre-wrap;margin:6px 0 0}
+.new{display:inline-block;font-size:.72rem;font-weight:700;color:#fff;background:var(--brand);border-radius:999px;padding:1px 8px;margin-right:4px}
+h2 .n{display:inline-block;min-width:20px;padding:0 6px;margin-left:6px;border-radius:999px;font-size:.75rem;background:var(--brand);color:#fff;text-align:center;vertical-align:middle}
 .who{display:inline-block;font-size:.78rem;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:0 8px;margin-left:4px}
 """
 
@@ -123,9 +125,17 @@ DURATIONS = {"1h": 1, "4h": 4, "24h": 24, "7g": 24 * 7, "sempre": None}
 DURATION_LABELS = [("1h", "1 ora"), ("4h", "4 ore"), ("24h", "24 ore"), ("7g", "7 giorni"), ("sempre", "Senza scadenza")]
 
 
+def _zone():
+    """Fuso orario di Home Assistant (UTC se non si riesce a leggerlo)."""
+    try:
+        return ha.local_tz()
+    except Exception:  # noqa: BLE001
+        return timezone.utc
+
+
 def fmt_epoch(ts):
     try:
-        return datetime.fromtimestamp(float(ts)).strftime("%d/%m/%Y alle %H:%M")
+        return datetime.fromtimestamp(float(ts), _zone()).strftime("%d/%m/%Y alle %H:%M")
     except (TypeError, ValueError, OverflowError, OSError):
         return "—"
 
@@ -136,7 +146,8 @@ def esc(value):
 
 def fmt(ts):
     try:
-        return datetime.fromisoformat(ts).astimezone().strftime("%d/%m/%Y %H:%M")
+        d = datetime.fromisoformat(ts)
+        return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).astimezone(_zone()).strftime("%d/%m/%Y %H:%M")
     except (TypeError, ValueError, OverflowError, OSError):
         return "—"
 
@@ -476,6 +487,8 @@ class Panel:
         if tickets is not None:
             tickets = self.visible_tickets(tickets, user)
         open_count = sum(1 for t in tickets or [] if isinstance(t, dict) and t.get("status") != "chiuso")
+        # comunicazioni che questo utente non ha ancora visto: si sommano al numero sulla scheda Richieste
+        new_notices = len(self.agent.unread_notices(user)) if paired else 0
         adm = self.agent.admin.get()
         admin_request = bool(adm["request"]) and adm["request"] != adm["declined"] and not self.agent.admin.active()
 
@@ -496,7 +509,7 @@ class Panel:
                     "preferenze": lambda: self._section_preferenze(s)}[section]()
             tabs = "" if not user["admin"] else '<nav class="tabs">' + "".join(
                 f'<a href="./?s={k}"{" class=on" if k == section else ""}>{l}'
-                + (f'<span class="n">{open_count}</span>' if k == "richieste" and open_count else "")
+                + (f'<span class="n">{open_count + new_notices}</span>' if k == "richieste" and open_count + new_notices else "")
                 + ('<span class="n">!</span>' if k == "impianto" and admin_request else "") + "</a>"
                 for k, l in SECTIONS) + "</nav>"
 
@@ -518,16 +531,19 @@ class Panel:
         notices = [n for n in self.agent.visible_notices() if isinstance(n.get("id"), int)][:10]
         if not notices:
             return ""
+        unread = set(self.agent.unread_notices(user))   # prima di segnarle come viste
         self.agent.mark_notices_read([n["id"] for n in notices], user)
         name = esc(s.get("server_name") or "dell&#39;installatore")
         rows = ""
         for i, n in enumerate(notices):
             by = f" · {esc(n.get('author'))}" if n.get("author") else ""
-            rows += (f'<details id="c{n["id"]}"{" open" if i == 0 else ""}><summary><b>{esc(n.get("title"))}</b> '
+            new = '<span class="new">Nuova</span> ' if n["id"] in unread else ""
+            rows += (f'<details id="c{n["id"]}"{" open" if i == 0 or n["id"] in unread else ""}><summary>{new}<b>{esc(n.get("title"))}</b> '
                      f'<span class="muted small">{fmt(n.get("created_at"))}{by}</span></summary>'
                      f'<p class="text">{esc(n.get("text"))}</p></details>')
         minutes = max(1, self.agent.NOTICE_HIDE_SECONDS // 60)
-        return (f'<div class="card notice" id="comunicazioni"><h2>Comunicazioni di {name}</h2>{rows}'
+        count = f' <span class="n">{len(unread)}</span>' if unread else ""
+        return (f'<div class="card notice" id="comunicazioni"><h2>Comunicazioni di {name}{count}</h2>{rows}'
                 f'<p class="muted small" style="margin:6px 0 0">Spariscono da qui {minutes} minuti dopo essere state lette.</p></div>')
 
     def _section_richieste(self, s, tickets, tickets_error, open_count, user=None):

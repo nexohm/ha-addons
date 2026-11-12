@@ -20,6 +20,15 @@
   (da Home Assistant 2025.1), oltre agli aggiornamenti disponibili.
 - La diagnostica manda anche il nome leggibile delle entità non disponibili, per l'elenco nella dashboard
   dell'installatore.
+- Comunicazioni nuove: «Nuova» accanto a quelle che l'utente non ha ancora visto (ognuno il suo), numero accanto al
+  titolo e sulla scheda Richieste; nella campanella la notifica resta finché qualcuno non apre il pannello.
+- Corretto: le notifiche sul telefono e negli altri servizi `notify` mostravano barre `\` davanti a caratteri come
+  `!`, `(`, `_`. L'escape del Markdown ora vale solo per la campanella di Home Assistant; altrove i link Markdown
+  inviati dal server diventano testo con l'indirizzo in vista.
+- Corretto: una comunicazione eliminata dall'installatore prima di essere letta lasciava la sua notifica nella
+  campanella.
+- Corretto: le ore nel pannello e nei nomi dei backup erano in UTC (un'ora indietro d'inverno): ora seguono il fuso
+  orario impostato in Home Assistant.
 
 ## 0.1.8
 - Pannello diviso in tre schede: Richieste, Impianto, Preferenze. La pagina è molto più corta e il

@@ -114,7 +114,7 @@ class Jobs:
         self.agent.send_diagnostics_soon()   # l'installatore vede subito backup e aggiornamenti aggiornati
 
     def _backup(self, job, reason):
-        stamp = datetime.now().strftime("%d/%m/%Y %H:%M")
+        stamp = datetime.now(ha.local_tz()).strftime("%d/%m/%Y %H:%M")
         name = f"Assistenza {stamp} - {reason}"[:80]
         job["message"] = "backup completo in corso"
         self._save(job)

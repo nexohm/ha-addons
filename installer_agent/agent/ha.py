@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import timezone
 
 HA_URL = os.environ.get("HA_URL", "http://supervisor/core/api").rstrip("/")
 SUPERVISOR_URL = os.environ.get("SUPERVISOR_URL", "http://supervisor").rstrip("/")
@@ -120,6 +121,40 @@ def states():
 
 def config():
     return _get(f"{HA_URL}/config")
+
+
+_tz = {"zone": None, "at": 0.0}
+
+
+def local_tz():
+    """Fuso orario di Home Assistant (Impostazioni → Sistema → Generale), per le ore mostrate al
+    cliente e nei nomi dei backup. Il container dell'add-on, da solo, ragiona in UTC.
+    Riletto al massimo ogni ora; se non si riesce, la variabile TZ o UTC."""
+    from zoneinfo import ZoneInfo
+    now = time.monotonic()
+    if _tz["zone"] is not None and now - _tz["at"] < 3600:
+        return _tz["zone"]
+    names = []
+    try:
+        names.append(config().get("time_zone"))
+    except HAError:
+        pass
+    names.append(os.environ.get("TZ"))
+    try:
+        with open(os.path.join(CONTAINER_ENV, "TZ")) as f:
+            names.append(f.read().strip())
+    except OSError:
+        pass
+    zone = timezone.utc
+    for name in names:
+        if isinstance(name, str) and name:
+            try:
+                zone = ZoneInfo(name)
+                break
+            except (ValueError, OSError, LookupError):
+                continue
+    _tz.update(zone=zone, at=now)
+    return zone
 
 
 def supervisor(path):
