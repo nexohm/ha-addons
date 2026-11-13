@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-AGENT_VERSION = "0.1.8"
+AGENT_VERSION = "0.1.9"
 PROTOCOL = 1
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
@@ -66,6 +66,16 @@ class State:
         "ticket_retention": {"days": None, "max_closed": None},
         "notify": {"ha": True, "services": []},
         "tickets_seen": None, "tickets_updated": None,
+        # richieste aperte da questo pannello: {id richiesta: id utente di HA} (vale anche con server vecchi)
+        "ticket_owners": {},
+        # comunicazioni dell'installatore
+        "notices": [], "notices_key": None, "notices_seen": None,
+        # letture delle comunicazioni: {id: {"at": epoch, "by": nome}} e quelle ancora da comunicare al server
+        "notices_read": {}, "notices_read_pending": [],
+        # chi ha già visto ogni comunicazione nel pannello: {id: [id utente HA]} (per «Nuova» a ognuno)
+        "notices_viewers": {},
+        # backup e aggiornamenti avviati dall'installatore (ultimi 10)
+        "jobs": [],
     }
 
     def __init__(self):
@@ -176,7 +186,7 @@ class Link:
                           last_error=None)
         return res
 
-    def report(self, ha_version=None, diagnostics=None, ha_urls=None, admin=None):
+    def report(self, ha_version=None, diagnostics=None, ha_urls=None, admin=None, notices_read=None, jobs=None):
         consent = self.state.consent_active()
         until = self.state.get("consent_until") if consent else None
         body = {"consent": consent, "ha_version": ha_version,
@@ -187,6 +197,10 @@ class Link:
             body["ha_urls"] = ha_urls
         if admin is not None:
             body["admin"] = admin
+        if notices_read:
+            body["notices_read"] = notices_read
+        if jobs is not None:
+            body["jobs"] = jobs
         res = self._request("POST", "/api/agent/report", body)
         branding = {k: str(res[k])[:100] for k in ("server_name", "brand_color")
                     if isinstance(res.get(k), str) and res[k] and res[k] != self.state.get(k)}
@@ -206,9 +220,19 @@ class Link:
         tickets = self._request("GET", "/api/agent/tickets").get("tickets")
         return tickets if isinstance(tickets, list) else []
 
-    def open_ticket(self, title, description, contact, diagnostics):
-        return self._request("POST", "/api/agent/tickets", {
-            "title": title, "description": description, "contact": contact, "diagnostics": diagnostics})
+    def open_ticket(self, title, description, contact, diagnostics, user=None):
+        body = {"title": title, "description": description, "contact": contact, "diagnostics": diagnostics}
+        if user:
+            body["user"] = user
+        return self._request("POST", "/api/agent/tickets", body)
 
-    def reply_ticket(self, tid, text):
-        return self._request("POST", f"/api/agent/tickets/{tid}/messages", {"text": text})
+    def reply_ticket(self, tid, text, user=None):
+        body = {"text": text}
+        if user:
+            body["user"] = user
+        return self._request("POST", f"/api/agent/tickets/{tid}/messages", body)
+
+    def notices(self):
+        res = self._request("GET", "/api/agent/notices")
+        notices = res.get("notices")
+        return (notices if isinstance(notices, list) else []), res.get("key")
