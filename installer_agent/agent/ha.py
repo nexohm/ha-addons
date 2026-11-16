@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import timezone
 
 HA_URL = os.environ.get("HA_URL", "http://supervisor/core/api").rstrip("/")
 SUPERVISOR_URL = os.environ.get("SUPERVISOR_URL", "http://supervisor").rstrip("/")
@@ -72,8 +73,26 @@ def _post(url, body, timeout=15):
         raise HAError(f"{url}: {e}") from e
 
 
-def call_service(domain, service, data):
-    return _post(f"{HA_URL}/services/{domain}/{service}", data)
+def call_service(domain, service, data, timeout=15):
+    return _post(f"{HA_URL}/services/{domain}/{service}", data, timeout)
+
+
+def state(entity_id):
+    """Stato di una singola entità, o None se non esiste."""
+    try:
+        return _get(f"{HA_URL}/states/{urllib.parse.quote(entity_id)}")
+    except HAError as e:
+        if "404" in str(e):
+            return None
+        raise
+
+
+def supervisor_post(path, body, timeout=15):
+    """Richiesta POST al Supervisor: restituisce il campo 'data', solleva HAError se fallisce."""
+    res = _post(f"{SUPERVISOR_URL}/{path.lstrip('/')}", body, timeout)
+    if isinstance(res, dict) and res.get("result") == "ok":
+        return res.get("data")
+    raise HAError(f"il Supervisor ha risposto: {(res or {}).get('message') if isinstance(res, dict) else res}")
 
 
 # Servizi notify da non proporre al cliente: la campanella è già un'opzione a parte,
@@ -102,6 +121,40 @@ def states():
 
 def config():
     return _get(f"{HA_URL}/config")
+
+
+_tz = {"zone": None, "at": 0.0}
+
+
+def local_tz():
+    """Fuso orario di Home Assistant (Impostazioni → Sistema → Generale), per le ore mostrate al
+    cliente e nei nomi dei backup. Il container dell'add-on, da solo, ragiona in UTC.
+    Riletto al massimo ogni ora; se non si riesce, la variabile TZ o UTC."""
+    from zoneinfo import ZoneInfo
+    now = time.monotonic()
+    if _tz["zone"] is not None and now - _tz["at"] < 3600:
+        return _tz["zone"]
+    names = []
+    try:
+        names.append(config().get("time_zone"))
+    except HAError:
+        pass
+    names.append(os.environ.get("TZ"))
+    try:
+        with open(os.path.join(CONTAINER_ENV, "TZ")) as f:
+            names.append(f.read().strip())
+    except OSError:
+        pass
+    zone = timezone.utc
+    for name in names:
+        if isinstance(name, str) and name:
+            try:
+                zone = ZoneInfo(name)
+                break
+            except (ValueError, OSError, LookupError):
+                continue
+    _tz.update(zone=zone, at=now)
+    return zone
 
 
 def supervisor(path):
@@ -248,6 +301,18 @@ def ws_commands(commands, timeout=10):
             (sock.sock if isinstance(sock, _Conn) else sock).close()
         except OSError:
             pass
+
+
+def users():
+    """Utenti di Home Assistant: {user_id: {"name", "admin"}}. Amministratore = proprietario o
+    gruppo system-admin; gli utenti di sistema e quelli disattivati non contano."""
+    out = {}
+    for u in ws_command("config/auth/list") or []:
+        if not isinstance(u, dict) or not isinstance(u.get("id"), str) or u.get("system_generated"):
+            continue
+        out[u["id"]] = {"name": u.get("name") or "", "active": u.get("is_active", True) is not False,
+                        "admin": bool(u.get("is_owner")) or "system-admin" in (u.get("group_ids") or [])}
+    return out
 
 
 def labels():

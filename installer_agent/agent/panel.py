@@ -11,7 +11,7 @@ import secrets
 import threading
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import ha
@@ -82,6 +82,10 @@ box-shadow:0 12px 32px rgba(0,0,0,.2);font-weight:600;animation:tin .35s cubic-b
 details.card{border-top:1px solid var(--line);padding:18px}details.card summary{font-size:1.02rem}
 .warnbox{background:var(--warnb);color:var(--ink);border-left:4px solid var(--warn);border-radius:8px;padding:10px 12px;margin:0 0 10px}
 .btn.small{padding:4px 10px;font-size:.85rem}.check{display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0}.check input{width:auto}
+.notice{border-left:4px solid var(--brand)}.notice details{padding:10px 0}.notice .text{white-space:pre-wrap;margin:6px 0 0}
+.new{display:inline-block;font-size:.72rem;font-weight:700;color:#fff;background:var(--brand);border-radius:999px;padding:1px 8px;margin-right:4px}
+h2 .n{display:inline-block;min-width:20px;padding:0 6px;margin-left:6px;border-radius:999px;font-size:.75rem;background:var(--brand);color:#fff;text-align:center;vertical-align:middle}
+.who{display:inline-block;font-size:.78rem;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:0 8px;margin-left:4px}
 """
 
 
@@ -113,15 +117,25 @@ RETURN_TO = {
     "includi": "impianto#escluse", "etichette": "impianto#etichette", "admin": "impianto#admin",
 }
 MAX_LABELS = 50
+# Cosa può fare un utente di Home Assistant non amministratore: aprire richieste e rispondere alle sue
+USER_ACTIONS = {"ticket", "rispondi"}
 
 # Durate tra cui il cliente sceglie quando attiva l'accesso remoto (ore; None = senza scadenza)
 DURATIONS = {"1h": 1, "4h": 4, "24h": 24, "7g": 24 * 7, "sempre": None}
 DURATION_LABELS = [("1h", "1 ora"), ("4h", "4 ore"), ("24h", "24 ore"), ("7g", "7 giorni"), ("sempre", "Senza scadenza")]
 
 
+def _zone():
+    """Fuso orario di Home Assistant (UTC se non si riesce a leggerlo)."""
+    try:
+        return ha.local_tz()
+    except Exception:  # noqa: BLE001
+        return timezone.utc
+
+
 def fmt_epoch(ts):
     try:
-        return datetime.fromtimestamp(float(ts)).strftime("%d/%m/%Y alle %H:%M")
+        return datetime.fromtimestamp(float(ts), _zone()).strftime("%d/%m/%Y alle %H:%M")
     except (TypeError, ValueError, OverflowError, OSError):
         return "—"
 
@@ -132,7 +146,8 @@ def esc(value):
 
 def fmt(ts):
     try:
-        return datetime.fromisoformat(ts).astimezone().strftime("%d/%m/%Y %H:%M")
+        d = datetime.fromisoformat(ts)
+        return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).astimezone(_zone()).strftime("%d/%m/%Y %H:%M")
     except (TypeError, ValueError, OverflowError, OSError):
         return "—"
 
@@ -167,7 +182,7 @@ class Panel:
     def __init__(self, agent, port=8099):
         self.agent = agent
         self.port = port
-        self.flash = None
+        self.flashes = {}   # messaggio da mostrare dopo un salvataggio, per utente
         # Token anti-CSRF: ogni modulo lo porta con sé; un altro sito non lo conosce e non può
         # inviare moduli al pannello (per esempio per riattivare l'accesso remoto).
         self.csrf = secrets.token_urlsafe(24)
@@ -192,11 +207,16 @@ class Panel:
                 for k, v in SECURITY_HEADERS.items():
                     self.send_header(k, v)
 
+            def _user(self):
+                # Intestazioni aggiunte dall'ingress di Home Assistant: arrivano solo dal Supervisor (_allowed)
+                return panel.agent.panel_user(self.headers.get("X-Remote-User-Id"),
+                                              self.headers.get("X-Remote-User-Display-Name") or self.headers.get("X-Remote-User-Name"))
+
             def do_GET(self):
                 if self._allowed():
                     query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                     try:
-                        body = panel.page((query.get("s") or [""])[0]).encode()
+                        body = panel.page((query.get("s") or [""])[0], self._user()).encode()
                     except Exception:  # noqa: BLE001 — il pannello non deve mai cadere
                         log.exception("errore nel pannello")
                         body = b"<!doctype html><meta charset=utf-8><p>Errore nel pannello: riprova tra poco.</p>"
@@ -221,11 +241,13 @@ class Panel:
                 form = {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
                 form_lists = urllib.parse.parse_qs(raw)  # campi ripetuti (caselle di spunta)
                 action = urllib.parse.urlsplit(self.path).path.rsplit("/", 1)[-1]
+                user = self._user()
                 if not secrets.compare_digest(form.get("csrf", ""), panel.csrf):
-                    panel.flash = ("Pagina scaduta: riprova.", True)
+                    flash = ("Pagina scaduta: riprova.", True)
                 else:
-                    result = panel.handle(action, form, form_lists)
-                    panel.flash = result if isinstance(result, tuple) or result is None else (result, False)
+                    result = panel.handle(action, form, form_lists, user)
+                    flash = result if isinstance(result, tuple) or result is None else (result, False)
+                panel.flashes[user["id"] or ""] = flash
                 # Torna alla scheda e al punto della pagina da cui si è partiti, con un percorso
                 # relativo (compatibile con l'ingress).
                 target = RETURN_TO.get(action, "richieste")
@@ -244,9 +266,24 @@ class Panel:
 
     # ---- azioni ----
 
-    def handle(self, action, form, lists=None):
+    def owner(self, t):
+        """Utente di Home Assistant che ha aperto la richiesta (None per quelle più vecchie)."""
+        oid = t.get("opened_by_id") if isinstance(t.get("opened_by_id"), str) else None
+        return oid or (self.agent.state.get("ticket_owners") or {}).get(str(t.get("id")))
+
+    def visible_tickets(self, tickets, user):
+        """L'amministratore vede tutte le richieste; un utente normale solo quelle aperte da lui."""
+        if user.get("admin"):
+            return list(tickets)
+        return [t for t in tickets if isinstance(t, dict) and user.get("id") and self.owner(t) == user["id"]]
+
+    def handle(self, action, form, lists=None, user=None):
         agent, state = self.agent, self.agent.state
         lists = lists or {}
+        user = user or {"id": None, "name": None, "admin": False}
+        if not user["admin"] and action not in USER_ACTIONS:
+            return ("Solo un amministratore di Home Assistant può cambiare queste impostazioni.", True)
+        who = {"id": user["id"], "name": user["name"]} if user["id"] else None
         try:
             if action == "escludi":
                 pattern = form.get("entity", "").strip().lower()
@@ -322,14 +359,23 @@ class Panel:
                 if not title:
                     return ("Scrivi almeno un titolo per la richiesta.", True)
                 diag = agent.fresh_diagnostics() if state.consent_active() else None
-                agent.link.open_ticket(title, form.get("description", "").strip(), form.get("contact", "").strip(), diag)
+                res = agent.link.open_ticket(title, form.get("description", "").strip(), form.get("contact", "").strip(), diag, who)
+                if who and isinstance(res.get("ticket_id"), int):
+                    owners = dict(state.get("ticket_owners") or {})
+                    owners[str(res["ticket_id"])] = who["id"]
+                    state.update(ticket_owners=dict(list(owners.items())[-500:]))
                 return "Richiesta inviata. Riceverai la risposta qui."
             if action == "rispondi":
                 text = form.get("text", "").strip()
-                if text:
-                    agent.link.reply_ticket(int(form.get("tid", 0)), text)
-                    return "Messaggio inviato."
-                return None
+                tid = form.get("tid", "")
+                if not text or not tid.isdigit():
+                    return None
+                if not user["admin"]:
+                    mine = [t for t in self.visible_tickets(agent.link.tickets(), user) if t.get("id") == int(tid)]
+                    if not mine:
+                        return ("Puoi rispondere solo alle tue richieste.", True)
+                agent.link.reply_ticket(int(tid), text, who)
+                return "Messaggio inviato."
             if action == "diagnostica":
                 agent.fresh_diagnostics()
                 return "Controllo completato."
@@ -381,38 +427,51 @@ class Panel:
                 f'<svg viewBox="0 0 52 52" aria-hidden="true"><circle class="ring" cx="26" cy="26" r="23"/>{mark}</svg>'
                 f'<span>{esc(text)}</span></div>')
 
-    def _ticket_html(self, t):
+    def _ticket_html(self, t, user=None):
         """Una richiesta del cliente. Tutto arriva dal server: si fa l'escape di ogni campo
         e si scarta quello che non ha la forma prevista."""
         if not isinstance(t, dict) or not isinstance(t.get("id"), int):
             return ""
+        user = user or {}
         status = t.get("status")
         msgs = ""
         for m in t.get("messages") if isinstance(t.get("messages"), list) else []:
             if not isinstance(m, dict):
                 continue
-            mine = m.get("author_type") == "cliente"
-            msgs += (f'<div class="msg {"cliente" if mine else "installatore"}"><div class="meta">'
-                     f'{"Tu" if mine else esc(m.get("author_name"))} · {fmt(m.get("created_at"))}</div>'
+            client = m.get("author_type") == "cliente"
+            author = m.get("author_name") if isinstance(m.get("author_name"), str) else ""
+            if client:
+                # i messaggi di casa portano il nome dell'utente di HA (con server vecchi solo «Cliente»)
+                label = "Tu" if author in ("", "Cliente", user.get("name")) else esc(author)
+            else:
+                label = esc(author)
+            msgs += (f'<div class="msg {"cliente" if client else "installatore"}"><div class="meta">'
+                     f'{label} · {fmt(m.get("created_at"))}</div>'
                      f'<p>{esc(m.get("text"))}</p></div>')
         badge = status if status in TICKET_LABELS else "off"
+        opener = t.get("opened_by") if isinstance(t.get("opened_by"), str) else None
+        who = (f'<span class="who">aperta da {esc(opener)}</span> ' if opener and user.get("admin")
+               and self.owner(t) != user.get("id") else "")
         return (f'<details id="t{t["id"]}"{" open" if status != "chiuso" else ""}><summary><b>{esc(t.get("title"))}</b> '
-                f'<span class="badge {badge}">{esc(TICKET_LABELS.get(status, status))}</span> '
+                f'<span class="badge {badge}">{esc(TICKET_LABELS.get(status, status))}</span> {who}'
                 f'<span class="muted small">{fmt(t.get("updated_at"))}</span></summary>{msgs}'
                 f'<form method="post" action="rispondi" class="row" style="margin-top:10px">{self._hidden()}'
                 f'<input type="hidden" name="tid" value="{t["id"]}"><input name="text" placeholder="Aggiungi un messaggio" style="flex:1">'
                 f'<button class="btn ghost">Invia</button></form></details>')
 
-    def page(self, section="", _redraw=True):
+    def page(self, section="", user=None, _redraw=True):
+        user = user or {"id": None, "name": None, "admin": False}
         s = self.agent.state.snapshot()
         name = s.get("server_name") or "Assistenza"
         conn_label, conn_cls = CONNECTION_LABELS.get(s.get("connection"), ("Sconosciuto", "off"))
         paired = bool(s.get("token")) and s.get("connection") not in ("revocato",)
-        flash, self.flash = self.flash, None
+        flash = self.flashes.pop(user["id"] or "", None)
         color = s.get("brand_color") or ""
         brand_css = f"<style>:root{{--brand:{color}}}</style>" if re.fullmatch(r"#[0-9a-fA-F]{6}", color) else ""
         if section not in dict(SECTIONS):
             section = "richieste" if paired else "impianto"
+        if not user["admin"]:
+            section = "richieste"   # impianto e preferenze sono solo per gli amministratori di casa
 
         # ---- richieste (servono anche per il numero sulla scheda) ----
         tickets, tickets_error = None, ""
@@ -423,27 +482,34 @@ class Panel:
                 if e.status in (401, 423, 426) and _redraw:
                     self.agent._handle_server_error(e)
                     # ridisegna una volta sola con lo stato aggiornato (revocato / sospeso / da aggiornare)
-                    return self.page(section, _redraw=False)
+                    return self.page(section, user, _redraw=False)
                 tickets_error = f'<p class="muted">Richieste non disponibili: {esc(e)}</p>'
+        if tickets is not None:
+            tickets = self.visible_tickets(tickets, user)
         open_count = sum(1 for t in tickets or [] if isinstance(t, dict) and t.get("status") != "chiuso")
+        # comunicazioni che questo utente non ha ancora visto: si sommano al numero sulla scheda Richieste
+        new_notices = len(self.agent.unread_notices(user)) if paired else 0
         adm = self.agent.admin.get()
         admin_request = bool(adm["request"]) and adm["request"] != adm["declined"] and not self.agent.admin.active()
 
         error_html = ""
-        if s.get("connection") in ("errore", "non_configurato", "aggiornare", "revocato", "sospeso"):
+        if not paired and not user["admin"]:
+            error_html = ('<div class="card"><h2>Collegamento</h2><p style="margin:0">L&#39;assistenza non è ancora attiva su '
+                          'questo Home Assistant: chiedi a chi lo amministra di configurarla.</p></div>')
+        elif s.get("connection") in ("errore", "non_configurato", "aggiornare", "revocato", "sospeso"):
             hint = s.get("last_error") or "Inserisci indirizzo del server e codice di abbinamento nella configurazione dell'add-on."
             error_html = f'<div class="card"><h2>Collegamento</h2><p style="margin:0">{esc(hint)}</p></div>'
 
         if not paired:
-            body = self._section_impianto(s, paired)
+            body = self._section_impianto(s, paired) if user["admin"] else ""
             tabs = ""
         else:
-            body = {"richieste": lambda: self._section_richieste(s, tickets, tickets_error, open_count),
+            body = {"richieste": lambda: self._section_richieste(s, tickets, tickets_error, open_count, user),
                     "impianto": lambda: self._section_impianto(s, paired),
                     "preferenze": lambda: self._section_preferenze(s)}[section]()
-            tabs = '<nav class="tabs">' + "".join(
+            tabs = "" if not user["admin"] else '<nav class="tabs">' + "".join(
                 f'<a href="./?s={k}"{" class=on" if k == section else ""}>{l}'
-                + (f'<span class="n">{open_count}</span>' if k == "richieste" and open_count else "")
+                + (f'<span class="n">{open_count + new_notices}</span>' if k == "richieste" and open_count + new_notices else "")
                 + ('<span class="n">!</span>' if k == "impianto" and admin_request else "") + "</a>"
                 for k, l in SECTIONS) + "</nav>"
 
@@ -459,20 +525,43 @@ class Panel:
 
     # ---- schede ----
 
-    def _section_richieste(self, s, tickets, tickets_error, open_count):
+    def _notices_html(self, s, user=None):
+        """Comunicazioni dell'installatore: le vede chiunque apra il pannello. La più recente è aperta.
+        Mostrarle vale come lettura: 30 minuti dopo la prima lettura spariscono dal pannello."""
+        notices = [n for n in self.agent.visible_notices() if isinstance(n.get("id"), int)][:10]
+        if not notices:
+            return ""
+        unread = set(self.agent.unread_notices(user))   # prima di segnarle come viste
+        self.agent.mark_notices_read([n["id"] for n in notices], user)
+        name = esc(s.get("server_name") or "dell&#39;installatore")
+        rows = ""
+        for i, n in enumerate(notices):
+            by = f" · {esc(n.get('author'))}" if n.get("author") else ""
+            new = '<span class="new">Nuova</span> ' if n["id"] in unread else ""
+            rows += (f'<details id="c{n["id"]}"{" open" if i == 0 or n["id"] in unread else ""}><summary>{new}<b>{esc(n.get("title"))}</b> '
+                     f'<span class="muted small">{fmt(n.get("created_at"))}{by}</span></summary>'
+                     f'<p class="text">{esc(n.get("text"))}</p></details>')
+        minutes = max(1, self.agent.NOTICE_HIDE_SECONDS // 60)
+        count = f' <span class="n">{len(unread)}</span>' if unread else ""
+        return (f'<div class="card notice" id="comunicazioni"><h2>Comunicazioni di {name}{count}</h2>{rows}'
+                f'<p class="muted small" style="margin:6px 0 0">Spariscono da qui {minutes} minuti dopo essere state lette.</p></div>')
+
+    def _section_richieste(self, s, tickets, tickets_error, open_count, user=None):
+        user = user or {}
         consent = self.agent.state.consent_active()
         tickets_html = tickets_error
         if tickets is not None:
             shown, hidden = filter_tickets(tickets, s.get("ticket_retention"))
             # prima le aperte, poi le chiuse (ognuna già in ordine di aggiornamento dal server)
             shown.sort(key=lambda t: isinstance(t, dict) and t.get("status") == "chiuso")
-            tickets_html += "".join(self._ticket_html(tk) for tk in shown)
+            tickets_html += "".join(self._ticket_html(tk, user) for tk in shown)
             if not tickets:
                 tickets_html = '<p class="muted">Nessuna richiesta finora.</p>'
             elif hidden:
+                where = ('le tue <a href="./?s=preferenze#lista">preferenze</a>' if user.get("admin")
+                         else "le preferenze di chi amministra Home Assistant")
                 tickets_html += (f'<p class="muted small">{hidden} richiest{"a chiusa nascosta" if hidden == 1 else "e chiuse nascoste"} '
-                                 'secondo le tue <a href="./?s=preferenze#lista">preferenze</a>. '
-                                 'L&#39;installatore ne conserva comunque lo storico.</p>')
+                                 f'secondo {where}. L&#39;installatore ne conserva comunque lo storico.</p>')
         # Il modulo per una nuova richiesta resta chiuso se ce n'è già una in corso: la pagina è più corta.
         new_form = f"""<details class="card" id="nuova"{"" if open_count else " open"}><summary><b>+ Nuova richiesta di assistenza</b></summary>
 <form method="post" action="ticket">{self._hidden()}<label for="title">Qual è il problema?</label>
@@ -481,7 +570,8 @@ class Panel:
 <label for="contact">Come ti ricontattiamo? (facoltativo)</label><input id="contact" name="contact" placeholder="Telefono o email">
 <p class="muted small">{"Alla richiesta viene allegato un controllo automatico dell&#39;impianto." if consent else ""}</p>
 <button class="btn">Invia richiesta</button></form></details>"""
-        return f'{new_form}<div class="card" id="richieste"><h2>Le tue richieste</h2>{tickets_html}</div>'
+        heading = "Richieste di casa" if user.get("admin") else "Le tue richieste"
+        return f'{self._notices_html(s, user)}{new_form}<div class="card" id="richieste"><h2>{heading}</h2>{tickets_html}</div>'
 
     def _section_impianto(self, s, paired):
         diag = s.get("last_diag") or {}

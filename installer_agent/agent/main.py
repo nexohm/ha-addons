@@ -13,9 +13,11 @@ import signal
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 
 from . import diagnostics, ha
 from .admin import AdminAccess, person
+from .jobs import Jobs
 from .link import AGENT_VERSION, DATA_DIR, Link, ServerError, State
 from .panel import Panel
 
@@ -51,7 +53,11 @@ class Agent:
         self._urls, self._urls_at = None, 0.0
         self._send_diag_now = False
         self._last_ticket_check = 0.0
+        self._users, self._users_at = None, 0.0
+        self._users_lock = threading.Lock()
+        self._reads_lock = threading.Lock()   # letture delle comunicazioni: pannello e rapporti
         self.admin = AdminAccess(self)
+        self.jobs = Jobs(self)
 
     # ---- utilità ----
 
@@ -97,12 +103,21 @@ class Agent:
 
     @staticmethod
     def _plain(text, limit=300):
-        """Testo che arriva dal server, ripulito per le notifiche di Home Assistant (che interpretano
-        il Markdown): niente link, immagini o formattazione decise dal server."""
+        """Testo che arriva dal server, ripulito per le notifiche: niente tag HTML (l'app Android li
+        interpreta), una riga sola, accorciato. L'escape del Markdown lo fa notify_client solo per la
+        campanella: sul telefono le barre comparirebbero tali e quali."""
         text = re.sub(r"<[^>]*>", "", str(text or ""))
-        text = re.sub(r"([\\`*_{}\[\]()#+!|>~])", r"\\\1", text)
+        # link e immagini Markdown ([testo](indirizzo), ![x](indirizzo)) diventano testo con l'indirizzo
+        # in vista: alcuni servizi notify (Telegram, Discord) il Markdown lo interpretano
+        text = re.sub(r"!?\[([^\]]*)\]\(([^)]*)\)", r"\1 (\2)", text)
+        text = text.replace("](", "] (")
         text = " ".join(text.split())
         return text[:limit] + ("…" if len(text) > limit else "")
+
+    @staticmethod
+    def _md(text):
+        """Escape del Markdown per la campanella di Home Assistant: niente link, immagini o formattazione."""
+        return re.sub(r"([\\`*_{}\[\]()#+!|>~<])", r"\\\1", str(text or ""))
 
     def notify_client(self, title, message, tag):
         settings = self.state.get("notify") or {}
@@ -110,7 +125,7 @@ class Agent:
         if settings.get("ha", True):
             try:
                 ha.call_service("persistent_notification", "create",
-                                {"title": title, "message": message, "notification_id": f"assistenza_{tag}"})
+                                {"title": self._md(title), "message": self._md(message), "notification_id": f"assistenza_{tag}"})
                 sent += 1
             except ha.HAError as e:
                 log.warning("Notifica in Home Assistant non riuscita: %s", e)
@@ -175,6 +190,133 @@ class Agent:
             new_seen = {**{k: v for k, v in seen.items() if k not in new_seen}, **new_seen}
         # teniamo solo i ticket recenti per non far crescere lo stato all'infinito
         self.state.update(tickets_seen=dict(list(new_seen.items())[-200:]), tickets_updated=tickets_updated)
+
+    # ---- utenti di Home Assistant che aprono il pannello ----
+
+    def panel_user(self, user_id, header_name=None):
+        """Chi sta usando il pannello. L'ingress di Home Assistant manda l'id dell'utente collegato
+        (X-Remote-User-Id); se è amministratore lo dice Home Assistant stesso. Senza id, o se Home
+        Assistant non risponde, si va sul sicuro: vista da utente normale."""
+        if not isinstance(user_id, str) or not re.fullmatch(r"[0-9a-f]{32}", user_id):
+            return {"id": None, "name": None, "admin": False}
+        with self._users_lock:
+            now = time.monotonic()
+            if self._users is None or now - self._users_at > 60 or user_id not in self._users:
+                try:
+                    self._users, self._users_at = ha.users(), now
+                except ha.HAError as e:
+                    log.warning("Utenti di Home Assistant non letti: %s", e)
+                    if self._users is None:
+                        self._users = {}
+            info = self._users.get(user_id) or {}
+        name = person(info.get("name") or header_name) or "Utente"
+        return {"id": user_id, "name": name, "admin": bool(info.get("admin")) and info.get("active", True)}
+
+    # ---- comunicazioni dell'installatore ----
+
+    NOTICE_FRESH_DAYS = 2   # al primo controllo si notificano solo quelle di questi ultimi giorni
+    # dopo quanto, dalla prima lettura nel pannello, una comunicazione sparisce dal pannello del cliente
+    NOTICE_HIDE_SECONDS = int(os.environ.get("NOTICE_HIDE_SECONDS", "1800"))
+
+    def visible_notices(self):
+        """Comunicazioni da mostrare: tutte tranne quelle lette da più di 30 minuti (sul server restano)."""
+        read = self.state.get("notices_read") or {}
+        now = time.time()
+        return [n for n in self.state.get("notices") or [] if isinstance(n, dict)
+                and not (str(n.get("id")) in read and now - read[str(n.get("id"))].get("at", now) >= self.NOTICE_HIDE_SECONDS)]
+
+    def _dismiss(self, ids):
+        """Toglie dalla campanella di Home Assistant le notifiche di queste comunicazioni (in background)."""
+        ids = [i for i in ids if isinstance(i, int)]
+        if not ids:
+            return
+
+        def run():
+            for i in ids:
+                try:
+                    ha.call_service("persistent_notification", "dismiss", {"notification_id": f"assistenza_comunicazione_{i}"})
+                except ha.HAError as e:
+                    log.warning("Notifica della comunicazione %s non tolta: %s", i, e)
+        threading.Thread(target=run, daemon=True, name="dismiss").start()
+
+    def unread_notices(self, user):
+        """Comunicazioni visibili che questo utente non ha ancora visto nel pannello (per «Nuova» e il numero)."""
+        viewers = self.state.get("notices_viewers") or {}
+        uid = (user or {}).get("id") or ""
+        return [n["id"] for n in self.visible_notices() if uid not in (viewers.get(str(n.get("id"))) or [])]
+
+    def mark_notices_read(self, ids, user):
+        """Comunicazioni appena viste nel pannello: si ricorda la prima lettura, la si manda al server
+        al prossimo rapporto e si toglie la notifica dalla campanella di Home Assistant."""
+        with self._reads_lock:
+            uid = (user or {}).get("id") or ""
+            viewers = dict(self.state.get("notices_viewers") or {})
+            changed = False
+            for i in ids:
+                seen_by = list(viewers.get(str(i)) or [])
+                if isinstance(i, int) and uid not in seen_by:
+                    viewers[str(i)] = (seen_by + [uid])[-20:]
+                    changed = True
+            if changed:
+                self.state.update(notices_viewers=viewers)
+            read = dict(self.state.get("notices_read") or {})
+            new = [i for i in ids if isinstance(i, int) and str(i) not in read]
+            if not new:
+                return
+            now = time.time()
+            by = (user or {}).get("name")
+            pending = list(self.state.get("notices_read_pending") or [])
+            for i in new:
+                read[str(i)] = {"at": now, "by": by}
+                pending.append({"id": i, "at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"), "by": by})
+            self.state.update(notices_read=read, notices_read_pending=pending[-100:])
+        self._dismiss(new)
+        self.wake()
+
+    def check_notices(self, key):
+        """Rilegge le comunicazioni se l'impronta mandata dal server è cambiata e avvisa il cliente
+        di quelle nuove. Tutto quello che arriva dal server viene ripulito e accorciato."""
+        if key == self.state.get("notices_key") and self.state.get("notices_seen") is not None:
+            return
+        if key is None:
+            # nessuna comunicazione (tutte eliminate dall'installatore): via anche dalla campanella
+            self._dismiss([n.get("id") for n in self.state.get("notices") or [] if isinstance(n, dict)])
+            self.state.update(notices=[], notices_key=None, notices_seen=self.state.get("notices_seen") or [],
+                              notices_read={}, notices_viewers={})
+            return
+        try:
+            raw, key = self.link.notices()
+        except ServerError as e:
+            log.warning("Comunicazioni non lette: %s", e)
+            return
+        notices = []
+        for n in raw[:20]:
+            if not isinstance(n, dict) or not isinstance(n.get("id"), int):
+                continue
+            notices.append({"id": n["id"], "title": str(n.get("title") or "")[:120], "text": str(n.get("text") or "")[:2000],
+                            "author": person(n.get("author_name")), "created_at": str(n.get("created_at") or "")[:40]})
+        seen = self.state.get("notices_seen")
+        name = self._plain(self.state.get("server_name") or "Assistenza", 60)
+        now = time.time()
+        for n in reversed(notices):
+            if seen is not None and n["id"] in seen:
+                continue
+            if seen is None:
+                try:
+                    age = now - datetime.fromisoformat(n["created_at"]).timestamp()
+                except ValueError:
+                    continue
+                if age > self.NOTICE_FRESH_DAYS * 86400:
+                    continue
+            self.notify_client(f"{name}: {self._plain(n['title'], 80)}", self._plain(n["text"], 300), f"comunicazione_{n['id']}")
+        ids = [n["id"] for n in notices]
+        # comunicazioni eliminate dall'installatore: la loro notifica non deve restare nella campanella
+        self._dismiss([n.get("id") for n in self.state.get("notices") or [] if isinstance(n, dict) and n.get("id") not in ids])
+        with self._reads_lock:
+            read = {k: v for k, v in (self.state.get("notices_read") or {}).items() if k.isdigit() and int(k) in ids}
+            viewers = {k: v for k, v in (self.state.get("notices_viewers") or {}).items() if k.isdigit() and int(k) in ids}
+            self.state.update(notices=notices, notices_key=key, notices_read=read, notices_viewers=viewers,
+                              notices_seen=sorted(set(ids) | set(seen or []))[-200:])
 
     def paired(self):
         return bool(self.state.get("token")) and self.state.get("connection") not in ("revocato", "aggiornare")
@@ -245,10 +387,17 @@ class Agent:
             self._send_diag_now = False
             try:
                 urls = self.ha_urls()
-                res = self.link.report(self.ha_version(), diag, urls, self.admin.status()) or {}
+                sent_reads = list(self.state.get("notices_read_pending") or [])
+                res = self.link.report(self.ha_version(), diag, urls, self.admin.status(), sent_reads, self.jobs.status()) or {}
+                if sent_reads:   # letture consegnate: restano in coda solo quelle arrivate nel frattempo
+                    with self._reads_lock:
+                        self.state.update(notices_read_pending=[r for r in self.state.get("notices_read_pending") or []
+                                                                if r not in sent_reads])
                 self.state.update(connection="collegato", last_error=None, last_contact=time.time())
                 self.admin.on_server_request(res.get("admin_requested"), res.get("admin_requested_by"))
                 self.check_ticket_updates(res.get("tickets_updated"), server_tells="tickets_updated" in res)
+                if "notices" in res:   # server che conosce le comunicazioni
+                    self.check_notices(res.get("notices"))
                 failures = 0
                 wait = self.options["heartbeat_seconds"]
             except ServerError as e:
@@ -261,7 +410,7 @@ class Agent:
 
     # ---- ciclo dei comandi ----
 
-    COMMANDS = {"ping", "run_diagnostics", "admin_password", "admin_close"}
+    COMMANDS = {"ping", "run_diagnostics", "admin_password", "admin_close", "create_backup", "install_update"}
 
     def execute(self, cmd):
         name = cmd.get("name")
@@ -285,6 +434,11 @@ class Agent:
             return False, None, "accesso remoto sospeso dal cliente"
         if name == "run_diagnostics":
             return True, self.fresh_diagnostics(), None
+        # backup e aggiornamenti: rispondono subito, il lavoro continua in background
+        if name == "create_backup":
+            return self.jobs.start(cmd["id"], "backup", args)
+        if name == "install_update":
+            return self.jobs.start(cmd["id"], "update", args)
         return False, None, "comando non gestito"
 
     def command_loop(self):
@@ -331,6 +485,10 @@ class Agent:
             log.info("Chiave del Supervisor trovata (%s)", ha.TOKEN_SOURCE)
         else:
             log.error("Chiave del Supervisor NON trovata: la diagnostica non potrà leggere Home Assistant")
+        try:
+            self.jobs.recover()
+        except Exception:  # noqa: BLE001
+            log.exception("Controllo delle operazioni rimaste in corso non riuscito")
         Panel(self, int(os.environ.get("PANEL_PORT", "8099"))).start()
         threading.Thread(target=self.report_loop, daemon=True, name="report").start()
         threading.Thread(target=self.command_loop, daemon=True, name="commands").start()

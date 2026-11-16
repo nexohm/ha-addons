@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.9
+- Pannello Assistenza visibile a tutti gli utenti di Home Assistant, non solo agli amministratori. Chi non è
+  amministratore apre richieste e vede e risponde solo alle sue; stato dell'impianto, accesso remoto, entità
+  controllate, accesso amministratore e preferenze restano agli amministratori. Chi sia amministratore lo dice
+  Home Assistant: se non si riesce a saperlo, il pannello mostra la vista ridotta.
+- Le richieste e le risposte portano il nome dell'utente di Home Assistant che le scrive: l'installatore vede chi
+  ha aperto la richiesta, l'amministratore di casa vede «aperta da …» sulle richieste degli altri.
+- Comunicazioni dell'installatore (novità, manutenzioni, nuove funzioni) in cima alla scheda Richieste, per tutti
+  gli utenti di casa, con una notifica alla prima ricezione. Aprendo il pannello la comunicazione risulta letta:
+  l'installatore vede quando e da chi, la notifica sparisce dalla campanella e 30 minuti dopo la comunicazione
+  sparisce dal pannello. Serve il server 0.2.8.
+- Backup e aggiornamenti avviati dall'installatore dalla sua dashboard, solo con l'accesso remoto attivo: backup
+  completo su richiesta e installazione degli aggiornamenti (Home Assistant, sistema operativo, Supervisor, add-on,
+  integrazioni e firmware che lo permettono). Prima di ogni aggiornamento viene fatto un backup completo: se non
+  riesce, l'aggiornamento non parte. Un'operazione alla volta; il cliente riceve una notifica all'inizio
+  dell'aggiornamento e alla fine. Se l'add-on si riavvia durante l'operazione, al riavvio controlla com'è finita.
+- La diagnostica manda all'installatore l'elenco dei backup (anche su NAS e cloud) e lo stato del backup automatico
+  (da Home Assistant 2025.1), oltre agli aggiornamenti disponibili.
+- La diagnostica manda anche il nome leggibile delle entità non disponibili, per l'elenco nella dashboard
+  dell'installatore.
+- Comunicazioni nuove: «Nuova» accanto a quelle che l'utente non ha ancora visto (ognuno il suo), numero accanto al
+  titolo e sulla scheda Richieste; nella campanella la notifica resta finché qualcuno non apre il pannello.
+- Corretto: le notifiche sul telefono e negli altri servizi `notify` mostravano barre `\` davanti a caratteri come
+  `!`, `(`, `_`. L'escape del Markdown ora vale solo per la campanella di Home Assistant; altrove i link Markdown
+  inviati dal server diventano testo con l'indirizzo in vista.
+- Corretto: una comunicazione eliminata dall'installatore prima di essere letta lasciava la sua notifica nella
+  campanella.
+- Corretto: le ore nel pannello e nei nomi dei backup erano in UTC (un'ora indietro d'inverno): ora seguono il fuso
+  orario impostato in Home Assistant.
+
 ## 0.1.8
 - Pannello diviso in tre schede: Richieste, Impianto, Preferenze. La pagina è molto più corta e il
   numero sulla scheda Richieste indica le richieste ancora aperte.
